@@ -1,0 +1,3 @@
+# Kiro Auto Allow - 実行に必要なライブラリ
+# GUI は Python 標準の tkinter を使うため追加不要
+comtypes>=1.4.17
