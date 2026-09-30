@@ -98,6 +98,10 @@ DEFAULTS: dict[str, Any] = {
         "max_button_height": 90,
         # 候補が複数: "skip"（何もしない） / "bottommost"（一番下＝最新）
         "on_multiple_candidates": "skip",
+        # 「何を許可するのか」を読み取る範囲。ボタンの上方向 px と左右のはみ出し許容 px
+        "approval_context_height_px": 320,
+        "approval_context_x_margin_px": 60,
+        "approval_detail_max_chars": 300,
     },
     "click": {
         "use_invoke": True,
@@ -132,6 +136,7 @@ DEFAULTS: dict[str, Any] = {
     "ui": {
         "auto_allow_default": False,
         "max_log_lines": 800,
+        "max_allowed_items": 30,
         "always_on_top": False,
     },
     "dump": {"max_depth": 16, "max_nodes": 6000, "open_after_dump": True},
@@ -179,6 +184,7 @@ INFO, OK, WARN, ERROR, DETECT = "info", "ok", "warn", "error", "detect"
 class LogBus:
     def __init__(self) -> None:
         self._q: "queue.Queue[tuple[str, str, str]]" = queue.Queue()
+        self._allowed_q: "queue.Queue[tuple[str, str]]" = queue.Queue()
         self._lock = threading.Lock()
         self._file: Path | None = None
         self._day = None
@@ -210,6 +216,20 @@ class LogBus:
 
     def detect(self, m: str) -> None:
         self.log(m, DETECT)
+
+    def allowed(self, text: str) -> None:
+        """Allow した内容を専用欄とログの両方へ流す。"""
+        self._allowed_q.put((datetime.now().strftime("%H:%M:%S"), text))
+        self.log(f"許可した内容: {text}", OK)
+
+    def drain_allowed(self, limit: int = 50) -> list[tuple[str, str]]:
+        out: list[tuple[str, str]] = []
+        for _ in range(limit):
+            try:
+                out.append(self._allowed_q.get_nowait())
+            except queue.Empty:
+                break
+        return out
 
     def drain(self, limit: int = 300) -> list[tuple[str, str, str]]:
         out = []
@@ -894,6 +914,9 @@ class ScanResult:
     approval_buttons: list[tuple[WindowInfo, ElemInfo]] = field(default_factory=list)
     approval_ui_found: bool = False
     approval_text: str = ""
+    # 承認ブロックから読み取った「何を許可するのか」
+    approval_lines: list[str] = field(default_factory=list)
+    approval_detail: str = ""
     target: tuple[WindowInfo, ElemInfo] | None = None
     checks: list[str] = field(default_factory=list)
     skip_reasons: list[str] = field(default_factory=list)
@@ -907,6 +930,81 @@ def _size_ok(b: ElemInfo, s: dict) -> bool:
         s["min_button_width"] <= b.width <= s["max_button_width"]
         and s["min_button_height"] <= b.height <= s["max_button_height"]
     )
+
+
+def _strip_icon_chars(name: str) -> str:
+    """アイコン用の私用領域文字を落とす。
+
+    VS Code / Kiro は codicon をテキストとして持っているため、
+    そのまま表示すると空白のように見える行が混ざる。
+    """
+    out = []
+    for ch in name:
+        o = ord(ch)
+        if 0xE000 <= o <= 0xF8FF:          # 基本多言語面の私用領域
+            continue
+        if 0xF0000 <= o <= 0x10FFFD:       # 補助私用領域
+            continue
+        out.append(ch)
+    return "".join(out).strip()
+
+
+def _is_meaningful_text(name: str) -> bool:
+    """人が読める内容が 2 文字以上あるか。"""
+    return len(_strip_icon_chars(name)) >= 2
+
+
+def approval_block_texts(uia: UiaSession, root, buttons: list[ElemInfo],
+                         s: dict) -> list[str]:
+    """承認ボタン群の「すぐ上」にあるテキストだけを拾う。
+
+    ウィンドウ全体から探すとチャットの過去ログまで拾ってしまうので、
+    ボタンの座標を基準に範囲を限定する。
+    """
+    if not buttons:
+        return []
+    left = min(b.rect[0] for b in buttons)
+    right = max(b.rect[2] for b in buttons)
+    top = min(b.rect[1] for b in buttons)
+    reach = int(s.get("approval_context_height_px", 320))
+    xmargin = int(s.get("approval_context_x_margin_px", 60))
+
+    picked: list[ElemInfo] = []
+    for t in uia.find_texts(root):
+        name = t.norm_name
+        if not name or t.offscreen or not _is_meaningful_text(name):
+            continue
+        r = t.rect
+        if r[3] > top + 4:            # ボタンより下にあるものは無関係
+            continue
+        if r[1] < top - reach:        # 離れすぎているものは別の投稿
+            continue
+        if r[2] < left - xmargin or r[0] > right + xmargin:
+            continue                  # 横方向にずれているものも除外
+        picked.append(t)
+
+    picked.sort(key=lambda t: (t.rect[1], t.rect[0]))
+    out: list[str] = []
+    seen: set[str] = set()
+    for t in picked:
+        n = _strip_icon_chars(t.norm_name)
+        if not _is_meaningful_text(t.norm_name):
+            continue                  # アイコンだけの要素は捨てる
+        if n not in seen:
+            seen.add(n)
+            out.append(n)
+    return out
+
+
+def summarize_approval(lines: list[str], s: dict) -> str:
+    """ログと画面に出すために 1 行へまとめる。"""
+    if not lines:
+        return ""
+    text = " / ".join(lines)
+    limit = int(s.get("approval_detail_max_chars", 300))
+    if len(text) > limit:
+        text = text[:limit] + "…"
+    return text
 
 
 def scan(uia: UiaSession, cfg: dict, check_busy: bool = False) -> ScanResult:
@@ -1024,20 +1122,6 @@ def scan(uia: UiaSession, cfg: dict, check_busy: bool = False) -> ScanResult:
         if not verified:
             continue
 
-        # --- 承認メッセージの文字列（確認材料。既定では必須にしない） ---
-        if not res.approval_text:
-            patterns = [str(p).lower() for p in s.get("approval_text_patterns", [])]
-            for t in uia.find_texts(root):
-                low = t.norm_name.lower()
-                if low and any(p in low for p in patterns):
-                    res.approval_text = t.norm_name
-                    break
-        if s.get("require_approval_text", False) and not res.approval_text:
-            res.skip_reasons.append(
-                "承認メッセージの文字列が見つからないためクリックしませんでした"
-            )
-            continue
-
         # --- 候補が複数のとき ---
         if len(verified) > 1:
             mode = str(s.get("on_multiple_candidates", "skip"))
@@ -1054,6 +1138,24 @@ def scan(uia: UiaSession, cfg: dict, check_busy: bool = False) -> ScanResult:
                 continue
         else:
             chosen = verified[0]
+
+        # --- 何を許可するのかを承認ブロックから読み取る ---
+        block = [
+            o for o in related
+            if abs(o.center_y - chosen.center_y) <= gtol and win.contains(o.rect)
+        ] or [chosen]
+        res.approval_lines = approval_block_texts(uia, root, block, s)
+        res.approval_detail = summarize_approval(res.approval_lines, s)
+        patterns = [str(p).lower() for p in s.get("approval_text_patterns", [])]
+        for n in res.approval_lines:
+            if any(p in n.lower() for p in patterns):
+                res.approval_text = n
+                break
+        if s.get("require_approval_text", False) and not res.approval_text:
+            res.skip_reasons.append(
+                "承認メッセージの文字列が見つからないためクリックしませんでした"
+            )
+            continue
 
         res.checks.append(f"Kiro ウィンドウ {win.describe()}")
         res.checks.append(
@@ -1467,8 +1569,8 @@ class Monitor(threading.Thread):
             if key != self._last_approval_key:
                 self._last_approval_key = key
                 self.log.detect("承認画面を検出しました")
-                if res.approval_text:
-                    self.log.info(f"承認メッセージ: {res.approval_text}")
+                if res.approval_detail:
+                    self.log.info(f"許可を求められた内容: {res.approval_detail}")
                 for _w, b in res.approval_buttons:
                     self.log.info(
                         f"検出したボタン：{b.norm_name}"
@@ -1518,6 +1620,7 @@ class Monitor(threading.Thread):
             self.state.click_count += 1
             self._clicks.append(now)
             self._clicked_keys[k] = now
+            self.log.allowed(res.approval_detail or "（内容を読み取れませんでした）")
         self._cooldown_until = time.monotonic() + float(self.cfg["post_click_cooldown_sec"])
 
 
@@ -1623,12 +1726,21 @@ class App:
         self.lbl_ready.pack(fill="x", padx=12, pady=(0, 4))
         self.lbl_ready.bind("<Button-1>", lambda _e: self._clear_ready())
 
+        allowf = tk.LabelFrame(
+            self.root, text=" Allow した内容（新しいものが上） ", bg=bg,
+            fg="#9cdcfe", font=("Segoe UI", 9),
+        )
+        allowf.pack(fill="x", padx=12, pady=(0, 6))
+        self.txt_allowed = tk.Text(
+            allowf, height=5, bg="#101820", fg="#9cdcfe",
+            insertbackground="#9cdcfe", font=("Consolas", 9), wrap="word",
+            state="disabled", borderwidth=0,
+        )
+        self.txt_allowed.pack(fill="x", padx=4, pady=4)
+
         tools = tk.Frame(self.root, bg=bg)
         tools.pack(fill="x", padx=12, pady=(0, 6))
-        tk.Button(tools, text="今すぐ1回だけ実行", command=self._run_once).pack(side="left")
-        tk.Button(tools, text="UI要素を確認", command=self._dump_ui).pack(side="left", padx=6)
-        tk.Button(tools, text="ログを消去", command=self._clear_log).pack(side="left", padx=6)
-        tk.Button(tools, text="保存フォルダを開く", command=self._open_folder).pack(side="left")
+        tk.Button(tools, text="UI要素を確認", command=self._dump_ui).pack(side="left")
 
         logf = tk.Frame(self.root, bg=bg)
         logf.pack(fill="both", expand=True, padx=12, pady=(0, 6))
@@ -1782,59 +1894,6 @@ class App:
             target=lambda: dump_ui(self.cfg, self.log), daemon=True
         ).start()
 
-    def _run_once(self) -> None:
-        """自動監視とは別に、その場で 1 回だけ検出→クリックを試す。"""
-        self.log.info("手動実行: いま表示されている承認画面を 1 回だけ処理します")
-        threading.Thread(target=self._run_once_worker, daemon=True).start()
-
-    def _run_once_worker(self) -> None:
-        try:
-            uia = UiaSession()
-        except Exception as e:
-            self.log.error(f"UI Automation を初期化できませんでした: {e}")
-            return
-        res = scan(uia, self.cfg)
-        if not res.windows:
-            self.log.warn("Kiro のウィンドウが見つかりません")
-            return
-        self.log.info(
-            "Kiro を検出しました: " + " / ".join(w.describe() for w in res.windows[:3])
-        )
-        if res.approval_buttons:
-            self.log.detect("承認画面を検出しました")
-            if res.approval_text:
-                self.log.info(f"承認メッセージ: {res.approval_text}")
-            for _w, b in res.approval_buttons:
-                self.log.info(
-                    f"検出したボタン：{b.norm_name}"
-                    f"（ControlType={b.control_type_name} Rect={b.rect}）"
-                )
-        else:
-            self.log.warn("承認画面は表示されていません")
-        if res.target is None:
-            for reason in dict.fromkeys(res.skip_reasons):
-                self.log.warn(f"クリックしませんでした: {reason}")
-            return
-        win, btn = res.target
-        self.log.detect(f"Allow ボタンを検出しました（{btn.rect}）")
-        for c in res.checks:
-            self.log.info(f"確認: {c}")
-        self.log.ok("クリック対象確認 OK")
-        if click_allow(uia, win, btn, self.cfg, self.log):
-            self.state.click_count += 1
-            self.monitor.reset_dedupe()
-
-    def _clear_log(self) -> None:
-        self.txt.configure(state="normal")
-        self.txt.delete("1.0", "end")
-        self.txt.configure(state="disabled")
-
-    def _open_folder(self) -> None:
-        try:
-            os.startfile(str(app_data_dir()))  # noqa: S606
-        except Exception as e:
-            self.log.error(f"フォルダを開けませんでした: {e}")
-
     def _on_close(self) -> None:
         self.state.auto_allow = False
         self.monitor.stop()
@@ -1883,6 +1942,17 @@ class App:
             self.lbl_ready.configure(text="", bg="#1e1e1e", fg="#1e1e1e")
 
     def _pump(self) -> None:
+        allowed = self.log.drain_allowed()
+        if allowed:
+            self.txt_allowed.configure(state="normal")
+            for stamp, text in allowed:
+                self.txt_allowed.insert("1.0", f"{stamp}  {text}\n")
+            keep = max(1, int(self.cfg["ui"].get("max_allowed_items", 30)))
+            total = int(self.txt_allowed.index("end-1c").split(".")[0])
+            if total > keep:
+                self.txt_allowed.delete(f"{keep + 1}.0", "end")
+            self.txt_allowed.configure(state="disabled")
+
         rows = self.log.drain()
         if rows:
             self.txt.configure(state="normal")

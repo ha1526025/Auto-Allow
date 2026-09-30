@@ -1,0 +1,5 @@
+﻿compile=0
+41743 INFO: Fixing EXE headers
+42337 INFO: Building EXE from EXE-00.toc completed successfully.
+42368 INFO: Build complete! The results are available in: C:\Users\関家颯\自動a
+llow\dist
