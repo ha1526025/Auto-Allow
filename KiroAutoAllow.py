@@ -1,0 +1,1589 @@
+"""Kiro Auto Allow  (単一ファイル版)
+
+Kiro の承認確認 UI（"Your approval is required to continue ..."）に出る
+一番左の「Allow」ボタンだけを Windows UI Automation で特定して自動クリックする。
+
+絶対にクリックしないもの:
+  Always allow / Deny / Always deny / Cancel / Reject
+  Kiro 以外のウィンドウにある Allow
+
+起動:
+    python KiroAutoAllow.py
+
+必要ライブラリ:
+    pip install comtypes
+"""
+
+from __future__ import annotations
+
+import ctypes
+import json
+import os
+import queue
+import sys
+import threading
+import time
+import tkinter as tk
+from collections import deque
+from ctypes import wintypes
+from dataclasses import dataclass, field
+from datetime import datetime
+from pathlib import Path
+from tkinter import ttk
+from typing import Any
+
+APP_NAME = "Kiro Auto Allow"
+APP_VERSION = "1.0.0"
+
+# =============================================================================
+#  保存先
+# =============================================================================
+
+
+def app_data_dir() -> Path:
+    base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+    d = Path(base) / "KiroAutoAllow"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def config_path() -> Path:
+    return app_data_dir() / "config.json"
+
+
+def logs_dir() -> Path:
+    d = app_data_dir() / "logs"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def dumps_dir() -> Path:
+    d = app_data_dir() / "ui_dumps"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+# =============================================================================
+#  設定
+# =============================================================================
+
+DEFAULTS: dict[str, Any] = {
+    "poll_interval_sec": 0.8,
+    "post_click_cooldown_sec": 1.5,
+    "max_clicks_per_minute": 12,
+    # 完全一致でこの名前のときだけクリックする（"Always allow" は一致しない）
+    "target_button_name": "Allow",
+    "never_click_names": [
+        "always allow", "deny", "always deny", "cancel", "reject", "always",
+    ],
+    "kiro": {
+        "process_names": ["kiro.exe"],
+        "window_classes": ["Chrome_WidgetWin_1"],
+        "title_contains": "",
+    },
+    "safety": {
+        "require_sibling_buttons": ["always allow", "deny"],
+        "group_vertical_tolerance_px": 160,
+        "require_allow_is_leftmost": True,
+        "same_row_tolerance_px": 24,
+        "require_approval_text": False,
+        "approval_text_patterns": [
+            "approval is required",
+            "your approval is required to continue",
+            "承認が必要",
+        ],
+        "min_button_width": 20,
+        "max_button_width": 400,
+        "min_button_height": 12,
+        "max_button_height": 90,
+        # 候補が複数: "skip"（何もしない） / "bottommost"（一番下＝最新）
+        "on_multiple_candidates": "skip",
+    },
+    "click": {
+        "use_invoke": True,
+        "use_legacy_default_action": True,
+        "allow_mouse_fallback": True,
+        "mouse_requires_foreground": True,
+        "restore_cursor": True,
+    },
+    "emergency": {"double_esc": True, "double_esc_window_ms": 600},
+    "ui": {
+        "auto_allow_default": False,
+        "test_mode_default": True,
+        "max_log_lines": 800,
+        "always_on_top": False,
+    },
+    "dump": {"max_depth": 16, "max_nodes": 6000, "open_after_dump": True},
+}
+
+
+def _deep_merge(base: dict, over: dict) -> dict:
+    import copy
+
+    out = copy.deepcopy(base)
+    for k, v in (over or {}).items():
+        if isinstance(v, dict) and isinstance(out.get(k), dict):
+            out[k] = _deep_merge(out[k], v)
+        else:
+            out[k] = v
+    return out
+
+
+def load_config() -> dict:
+    p = config_path()
+    user: dict[str, Any] = {}
+    if p.exists():
+        try:
+            loaded = json.loads(p.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                user = loaded
+        except Exception:
+            user = {}
+    cfg = _deep_merge(DEFAULTS, user)
+    if not p.exists():
+        try:
+            p.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+    return cfg
+
+
+# =============================================================================
+#  ログ
+# =============================================================================
+
+INFO, OK, WARN, ERROR, DETECT = "info", "ok", "warn", "error", "detect"
+
+
+class LogBus:
+    def __init__(self) -> None:
+        self._q: "queue.Queue[tuple[str, str, str]]" = queue.Queue()
+        self._lock = threading.Lock()
+        self._file: Path | None = None
+        self._day = None
+
+    def log(self, message: str, level: str = INFO) -> None:
+        now = datetime.now()
+        self._q.put((now.strftime("%H:%M:%S"), message, level))
+        try:
+            with self._lock:
+                if self._file is None or self._day != now.date():
+                    self._day = now.date()
+                    self._file = logs_dir() / f"kiro_auto_allow_{now:%Y%m%d}.log"
+                with self._file.open("a", encoding="utf-8") as fp:
+                    fp.write(f"{now:%Y-%m-%d %H:%M:%S} [{level}] {message}\n")
+        except Exception:
+            pass
+
+    def info(self, m: str) -> None:
+        self.log(m, INFO)
+
+    def ok(self, m: str) -> None:
+        self.log(m, OK)
+
+    def warn(self, m: str) -> None:
+        self.log(m, WARN)
+
+    def error(self, m: str) -> None:
+        self.log(m, ERROR)
+
+    def detect(self, m: str) -> None:
+        self.log(m, DETECT)
+
+    def drain(self, limit: int = 300) -> list[tuple[str, str, str]]:
+        out = []
+        for _ in range(limit):
+            try:
+                out.append(self._q.get_nowait())
+            except queue.Empty:
+                break
+        return out
+
+
+# =============================================================================
+#  Win32
+# =============================================================================
+
+user32 = ctypes.WinDLL("user32", use_last_error=True)
+kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+user32.EnumWindows.argtypes = [WNDENUMPROC, wintypes.LPARAM]
+user32.EnumWindows.restype = wintypes.BOOL
+user32.IsWindowVisible.argtypes = [wintypes.HWND]
+user32.IsWindow.argtypes = [wintypes.HWND]
+user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+user32.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+user32.GetForegroundWindow.restype = wintypes.HWND
+user32.GetAsyncKeyState.argtypes = [ctypes.c_int]
+user32.GetAsyncKeyState.restype = ctypes.c_short
+user32.SetCursorPos.argtypes = [ctypes.c_int, ctypes.c_int]
+user32.GetCursorPos.argtypes = [ctypes.POINTER(wintypes.POINT)]
+kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+kernel32.OpenProcess.restype = wintypes.HANDLE
+kernel32.QueryFullProcessImageNameW.argtypes = [
+    wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)
+]
+kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+
+PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+VK_ESCAPE = 0x1B
+
+
+def enum_top_level_windows() -> list[int]:
+    found: list[int] = []
+
+    def _cb(hwnd, _l):
+        found.append(hwnd)
+        return True
+
+    user32.EnumWindows(WNDENUMPROC(_cb), 0)
+    return found
+
+
+def window_title(hwnd: int) -> str:
+    b = ctypes.create_unicode_buffer(512)
+    user32.GetWindowTextW(hwnd, b, 512)
+    return b.value
+
+
+def window_class(hwnd: int) -> str:
+    b = ctypes.create_unicode_buffer(256)
+    user32.GetClassNameW(hwnd, b, 256)
+    return b.value
+
+
+def window_pid(hwnd: int) -> int:
+    pid = wintypes.DWORD(0)
+    user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+    return int(pid.value)
+
+
+def window_rect(hwnd: int) -> tuple[int, int, int, int]:
+    r = wintypes.RECT()
+    if not user32.GetWindowRect(hwnd, ctypes.byref(r)):
+        return (0, 0, 0, 0)
+    return (r.left, r.top, r.right, r.bottom)
+
+
+def process_image_path(pid: int) -> str:
+    if pid <= 0:
+        return ""
+    h = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not h:
+        return ""
+    try:
+        size = wintypes.DWORD(1024)
+        buf = ctypes.create_unicode_buffer(size.value)
+        if kernel32.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(size)):
+            return buf.value
+        return ""
+    finally:
+        kernel32.CloseHandle(h)
+
+
+class _MOUSEINPUT(ctypes.Structure):
+    _fields_ = [
+        ("dx", wintypes.LONG), ("dy", wintypes.LONG), ("mouseData", wintypes.DWORD),
+        ("dwFlags", wintypes.DWORD), ("time", wintypes.DWORD),
+        ("dwExtraInfo", ctypes.c_size_t),
+    ]
+
+
+class _INPUT(ctypes.Structure):
+    class _U(ctypes.Union):
+        _fields_ = [("mi", _MOUSEINPUT)]
+
+    _anonymous_ = ("u",)
+    _fields_ = [("type", wintypes.DWORD), ("u", _U)]
+
+
+user32.SendInput.argtypes = [wintypes.UINT, ctypes.POINTER(_INPUT), ctypes.c_int]
+user32.SendInput.restype = wintypes.UINT
+MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP = 0x0002, 0x0004
+
+
+def cursor_pos() -> tuple[int, int]:
+    p = wintypes.POINT()
+    user32.GetCursorPos(ctypes.byref(p))
+    return (p.x, p.y)
+
+
+def physical_left_click(x: int, y: int, restore: bool = True) -> bool:
+    old = cursor_pos()
+    if not user32.SetCursorPos(int(x), int(y)):
+        return False
+    time.sleep(0.03)
+    ev = (_INPUT * 2)()
+    for i, flag in enumerate((MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP)):
+        ev[i].type = 0
+        ev[i].mi = _MOUSEINPUT(0, 0, 0, flag, 0, 0)
+    sent = user32.SendInput(2, ev, ctypes.sizeof(_INPUT))
+    if restore:
+        time.sleep(0.03)
+        user32.SetCursorPos(old[0], old[1])
+    return sent == 2
+
+
+class DoubleEscWatcher:
+    """Esc を横取りせずに監視し、素早い 2 回押しを検出する。"""
+
+    def __init__(self, window_ms: int = 600) -> None:
+        self.window_sec = window_ms / 1000.0
+        self._was_down = False
+        self._last = 0.0
+
+    def poll(self) -> bool:
+        down = bool(user32.GetAsyncKeyState(VK_ESCAPE) & 0x8000)
+        hit = False
+        if down and not self._was_down:
+            now = time.monotonic()
+            if now - self._last <= self.window_sec:
+                hit = True
+                self._last = 0.0
+            else:
+                self._last = now
+        self._was_down = down
+        return hit
+
+
+def enable_dpi_awareness() -> None:
+    try:
+        user32.SetProcessDpiAwarenessContext.argtypes = [ctypes.c_void_p]
+        if user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4)):
+            return
+    except Exception:
+        pass
+    try:
+        ctypes.WinDLL("shcore").SetProcessDpiAwareness(2)
+        return
+    except Exception:
+        pass
+    try:
+        user32.SetProcessDPIAware()
+    except Exception:
+        pass
+
+
+# =============================================================================
+#  UI Automation
+# =============================================================================
+
+import comtypes  # noqa: E402
+import comtypes.client  # noqa: E402
+
+UIA_RuntimeIdPropertyId = 30000
+UIA_BoundingRectanglePropertyId = 30001
+UIA_ProcessIdPropertyId = 30002
+UIA_ControlTypePropertyId = 30003
+UIA_LocalizedControlTypePropertyId = 30004
+UIA_NamePropertyId = 30005
+UIA_IsEnabledPropertyId = 30010
+UIA_AutomationIdPropertyId = 30011
+UIA_ClassNamePropertyId = 30012
+UIA_HelpTextPropertyId = 30013
+UIA_IsOffscreenPropertyId = 30022
+UIA_IsInvokePatternAvailablePropertyId = 30031
+
+UIA_ButtonControlTypeId = 50000
+UIA_TextControlTypeId = 50020
+
+CONTROL_TYPE_NAMES = {
+    50000: "Button", 50001: "Calendar", 50002: "CheckBox", 50003: "ComboBox",
+    50004: "Edit", 50005: "Hyperlink", 50006: "Image", 50007: "ListItem",
+    50008: "List", 50009: "Menu", 50010: "MenuBar", 50011: "MenuItem",
+    50012: "ProgressBar", 50013: "RadioButton", 50014: "ScrollBar",
+    50015: "Slider", 50016: "Spinner", 50017: "StatusBar", 50018: "Tab",
+    50019: "TabItem", 50020: "Text", 50021: "ToolBar", 50022: "ToolTip",
+    50023: "Tree", 50024: "TreeItem", 50025: "Custom", 50026: "Group",
+    50027: "Thumb", 50028: "DataGrid", 50029: "DataItem", 50030: "Document",
+    50031: "SplitButton", 50032: "Window", 50033: "Pane", 50034: "Header",
+    50035: "HeaderItem", 50036: "Table", 50037: "TitleBar", 50038: "Separator",
+    50039: "SemanticZoom", 50040: "AppBar",
+}
+
+TreeScope_Element = 1
+TreeScope_Descendants = 4
+AutomationElementMode_Full = 1
+UIA_InvokePatternId = 10000
+UIA_LegacyIAccessiblePatternId = 10018
+
+_mod_lock = threading.Lock()
+_mod: Any = None
+
+
+def uia_module():
+    global _mod
+    with _mod_lock:
+        if _mod is None:
+            comtypes.client.GetModule("UIAutomationCore.dll")
+            from comtypes.gen import UIAutomationClient as m
+            _mod = m
+    return _mod
+
+
+def control_type_name(ct: int) -> str:
+    return CONTROL_TYPE_NAMES.get(int(ct or 0), f"Unknown({ct})")
+
+
+def normalize_name(raw: str | None) -> str:
+    """比較用に整える。前後空白・NBSP・全角空白を除去し連続空白を 1 個に潰す。
+
+    大文字小文字は変えない（完全一致判定のため）。
+    """
+    if not raw:
+        return ""
+    s = str(raw).replace("\u00a0", " ").replace("\u3000", " ")
+    return " ".join(s.split())
+
+
+@dataclass
+class ElemInfo:
+    name: str = ""
+    control_type: int = 0
+    automation_id: str = ""
+    class_name: str = ""
+    localized_type: str = ""
+    help_text: str = ""
+    enabled: bool = False
+    offscreen: bool = True
+    rect: tuple[int, int, int, int] = (0, 0, 0, 0)
+    pid: int = 0
+    runtime_id: tuple[int, ...] = ()
+    invokable: bool = False
+    element: Any = field(default=None, repr=False)
+
+    @property
+    def control_type_name(self) -> str:
+        return control_type_name(self.control_type)
+
+    @property
+    def width(self) -> int:
+        return self.rect[2] - self.rect[0]
+
+    @property
+    def height(self) -> int:
+        return self.rect[3] - self.rect[1]
+
+    @property
+    def center(self) -> tuple[int, int]:
+        return ((self.rect[0] + self.rect[2]) // 2, (self.rect[1] + self.rect[3]) // 2)
+
+    @property
+    def center_y(self) -> int:
+        return (self.rect[1] + self.rect[3]) // 2
+
+    @property
+    def left(self) -> int:
+        return self.rect[0]
+
+    @property
+    def norm_name(self) -> str:
+        return normalize_name(self.name)
+
+    def key(self) -> str:
+        return ",".join(str(i) for i in self.runtime_id) or f"rect{self.rect}"
+
+
+class UiaSession:
+    """1 スレッド分の UIA セッション。使うスレッド内で生成すること。"""
+
+    def __init__(self) -> None:
+        try:
+            comtypes.CoInitializeEx(comtypes.COINIT_MULTITHREADED)
+        except Exception:
+            try:
+                comtypes.CoInitialize()
+            except Exception:
+                pass
+        m = uia_module()
+        self.m = m
+        self.iuia = comtypes.client.CreateObject(m.CUIAutomation, interface=m.IUIAutomation)
+        self._button_cond = self.iuia.CreatePropertyCondition(
+            UIA_ControlTypePropertyId, UIA_ButtonControlTypeId
+        )
+        self._text_cond = self.iuia.CreatePropertyCondition(
+            UIA_ControlTypePropertyId, UIA_TextControlTypeId
+        )
+        self._cache = self._make_cache()
+
+    def _make_cache(self):
+        cr = self.iuia.CreateCacheRequest()
+        for pid in (
+            UIA_NamePropertyId, UIA_ControlTypePropertyId, UIA_AutomationIdPropertyId,
+            UIA_ClassNamePropertyId, UIA_LocalizedControlTypePropertyId,
+            UIA_HelpTextPropertyId, UIA_IsEnabledPropertyId, UIA_IsOffscreenPropertyId,
+            UIA_BoundingRectanglePropertyId, UIA_ProcessIdPropertyId,
+            UIA_RuntimeIdPropertyId, UIA_IsInvokePatternAvailablePropertyId,
+        ):
+            try:
+                cr.AddProperty(pid)
+            except Exception:
+                pass
+        cr.TreeScope = TreeScope_Element
+        cr.AutomationElementMode = AutomationElementMode_Full
+        return cr
+
+    def element_from_handle(self, hwnd: int):
+        return self.iuia.ElementFromHandle(hwnd)
+
+    # ---- 取得 -------------------------------------------------------------
+    def _cached_info(self, el) -> ElemInfo:
+        i = ElemInfo(element=el)
+        for attr, setter in (
+            ("CachedName", lambda v: setattr(i, "name", v or "")),
+            ("CachedControlType", lambda v: setattr(i, "control_type", int(v or 0))),
+            ("CachedAutomationId", lambda v: setattr(i, "automation_id", v or "")),
+            ("CachedClassName", lambda v: setattr(i, "class_name", v or "")),
+            ("CachedLocalizedControlType", lambda v: setattr(i, "localized_type", v or "")),
+            ("CachedHelpText", lambda v: setattr(i, "help_text", v or "")),
+            ("CachedIsEnabled", lambda v: setattr(i, "enabled", bool(v))),
+            ("CachedIsOffscreen", lambda v: setattr(i, "offscreen", bool(v))),
+            ("CachedProcessId", lambda v: setattr(i, "pid", int(v or 0))),
+        ):
+            try:
+                setter(getattr(el, attr))
+            except Exception:
+                pass
+        try:
+            r = el.CachedBoundingRectangle
+            i.rect = (int(r.left), int(r.top), int(r.right), int(r.bottom))
+        except Exception:
+            pass
+        try:
+            rid = el.GetCachedPropertyValue(UIA_RuntimeIdPropertyId)
+            i.runtime_id = tuple(int(x) for x in rid) if rid else ()
+        except Exception:
+            pass
+        try:
+            i.invokable = bool(
+                el.GetCachedPropertyValue(UIA_IsInvokePatternAvailablePropertyId)
+            )
+        except Exception:
+            pass
+        return i
+
+    def current_info(self, el) -> ElemInfo:
+        """キャッシュを使わず今の状態を読み直す（クリック直前の再確認用）。"""
+        i = ElemInfo(element=el)
+        for attr, setter in (
+            ("CurrentName", lambda v: setattr(i, "name", v or "")),
+            ("CurrentControlType", lambda v: setattr(i, "control_type", int(v or 0))),
+            ("CurrentAutomationId", lambda v: setattr(i, "automation_id", v or "")),
+            ("CurrentClassName", lambda v: setattr(i, "class_name", v or "")),
+            ("CurrentLocalizedControlType", lambda v: setattr(i, "localized_type", v or "")),
+            ("CurrentIsEnabled", lambda v: setattr(i, "enabled", bool(v))),
+            ("CurrentIsOffscreen", lambda v: setattr(i, "offscreen", bool(v))),
+            ("CurrentProcessId", lambda v: setattr(i, "pid", int(v or 0))),
+        ):
+            try:
+                setter(getattr(el, attr))
+            except Exception:
+                pass
+        try:
+            r = el.CurrentBoundingRectangle
+            i.rect = (int(r.left), int(r.top), int(r.right), int(r.bottom))
+        except Exception:
+            pass
+        try:
+            rid = el.GetRuntimeId()
+            i.runtime_id = tuple(int(x) for x in rid) if rid else ()
+        except Exception:
+            pass
+        try:
+            i.invokable = bool(
+                el.GetCurrentPropertyValue(UIA_IsInvokePatternAvailablePropertyId)
+            )
+        except Exception:
+            pass
+        return i
+
+    def _find_all(self, root, cond) -> list[ElemInfo]:
+        try:
+            arr = root.FindAllBuildCache(TreeScope_Descendants, cond, self._cache)
+        except Exception:
+            return []
+        if arr is None:
+            return []
+        try:
+            n = int(arr.Length)
+        except Exception:
+            return []
+        out: list[ElemInfo] = []
+        for k in range(n):
+            try:
+                out.append(self._cached_info(arr.GetElement(k)))
+            except Exception:
+                continue
+        return out
+
+    def find_buttons(self, root) -> list[ElemInfo]:
+        return self._find_all(root, self._button_cond)
+
+    def find_texts(self, root) -> list[ElemInfo]:
+        return self._find_all(root, self._text_cond)
+
+    # ---- 操作 -------------------------------------------------------------
+    def invoke(self, el) -> bool:
+        try:
+            pat = el.GetCurrentPattern(UIA_InvokePatternId)
+        except Exception:
+            return False
+        if not pat:
+            return False
+        try:
+            pat.QueryInterface(self.m.IUIAutomationInvokePattern).Invoke()
+            return True
+        except Exception:
+            return False
+
+    def legacy_default_action(self, el) -> bool:
+        try:
+            pat = el.GetCurrentPattern(UIA_LegacyIAccessiblePatternId)
+        except Exception:
+            return False
+        if not pat:
+            return False
+        try:
+            pat.QueryInterface(
+                self.m.IUIAutomationLegacyIAccessiblePattern
+            ).DoDefaultAction()
+            return True
+        except Exception:
+            return False
+
+    def parent_of(self, el):
+        try:
+            return self.iuia.ControlViewWalker.GetParentElement(el)
+        except Exception:
+            return None
+
+    def first_child(self, el):
+        try:
+            return self.iuia.ControlViewWalker.GetFirstChildElement(el)
+        except Exception:
+            return None
+
+    def next_sibling(self, el):
+        try:
+            return self.iuia.ControlViewWalker.GetNextSiblingElement(el)
+        except Exception:
+            return None
+
+
+# =============================================================================
+#  Kiro ウィンドウ特定
+# =============================================================================
+
+
+@dataclass
+class WindowInfo:
+    hwnd: int
+    pid: int
+    title: str
+    class_name: str
+    exe_path: str
+    rect: tuple[int, int, int, int]
+
+    @property
+    def exe_name(self) -> str:
+        return os.path.basename(self.exe_path).lower()
+
+    def contains(self, r: tuple[int, int, int, int], margin: int = 6) -> bool:
+        l, t, rr, b = self.rect
+        return (
+            r[0] >= l - margin and r[1] >= t - margin
+            and r[2] <= rr + margin and r[3] <= b + margin
+        )
+
+    def describe(self) -> str:
+        return f"'{self.title}' (hwnd=0x{self.hwnd:X}, pid={self.pid}, {self.exe_name})"
+
+
+def find_kiro_windows(cfg: dict) -> list[WindowInfo]:
+    """表示中の Kiro のトップレベルウィンドウだけを列挙する。
+
+    判定の主役はウィンドウ所有プロセスの実行ファイル名（kiro.exe）。
+    """
+    kcfg = cfg.get("kiro", {})
+    want_exes = {str(x).lower() for x in kcfg.get("process_names", ["kiro.exe"])}
+    want_classes = {str(x) for x in kcfg.get("window_classes", []) if x}
+    title_contains = str(kcfg.get("title_contains", "") or "")
+
+    exe_cache: dict[int, str] = {}
+    out: list[WindowInfo] = []
+    for hwnd in enum_top_level_windows():
+        if not user32.IsWindowVisible(hwnd):
+            continue
+        title = window_title(hwnd)
+        if not title:
+            continue
+        rect = window_rect(hwnd)
+        if rect[2] - rect[0] <= 0 or rect[3] - rect[1] <= 0:
+            continue
+        pid = window_pid(hwnd)
+        if pid <= 0:
+            continue
+        exe = exe_cache.get(pid)
+        if exe is None:
+            exe = process_image_path(pid)
+            exe_cache[pid] = exe
+        if os.path.basename(exe).lower() not in want_exes:
+            continue
+        cls = window_class(hwnd)
+        if want_classes and cls not in want_classes:
+            continue
+        if title_contains and title_contains.lower() not in title.lower():
+            continue
+        out.append(WindowInfo(hwnd, pid, title, cls, exe, rect))
+    return out
+
+
+# =============================================================================
+#  承認 UI / Allow ボタンの検出
+# =============================================================================
+
+APPROVAL_NAMES_LOWER = {"allow", "always allow", "deny", "always deny"}
+
+
+@dataclass
+class ScanResult:
+    windows: list[WindowInfo] = field(default_factory=list)
+    # (ウィンドウ, ボタン) 承認 UI 関連として見つかったボタン全部（ログ用）
+    approval_buttons: list[tuple[WindowInfo, ElemInfo]] = field(default_factory=list)
+    approval_ui_found: bool = False
+    approval_text: str = ""
+    target: tuple[WindowInfo, ElemInfo] | None = None
+    checks: list[str] = field(default_factory=list)
+    skip_reasons: list[str] = field(default_factory=list)
+
+
+def _size_ok(b: ElemInfo, s: dict) -> bool:
+    return (
+        s["min_button_width"] <= b.width <= s["max_button_width"]
+        and s["min_button_height"] <= b.height <= s["max_button_height"]
+    )
+
+
+def scan(uia: UiaSession, cfg: dict) -> ScanResult:
+    """Kiro の承認 UI を探し、クリックしてよい Allow ボタンを 1 つだけ決める。"""
+    res = ScanResult()
+    s = cfg["safety"]
+    target_name = cfg["target_button_name"]
+    never = {str(x).lower() for x in cfg.get("never_click_names", [])}
+
+    res.windows = find_kiro_windows(cfg)
+    if not res.windows:
+        return res
+
+    for win in res.windows:
+        try:
+            root = uia.element_from_handle(win.hwnd)
+        except Exception:
+            res.skip_reasons.append(f"{win.describe()} の UI 要素を取得できませんでした")
+            continue
+        if root is None:
+            continue
+
+        buttons = uia.find_buttons(root)
+        if not buttons:
+            continue
+
+        # --- 承認 UI 関連のボタンを拾う（ログ用） ---
+        related = [b for b in buttons if b.norm_name.lower() in APPROVAL_NAMES_LOWER]
+        for b in related:
+            res.approval_buttons.append((win, b))
+
+        # --- 「Allow」完全一致の候補 ---
+        candidates = [b for b in buttons if b.norm_name == target_name]
+        # 絶対にクリックしない名前は二重に排除
+        candidates = [b for b in candidates if b.norm_name.lower() not in never]
+        if not candidates:
+            continue
+
+        # --- 基本的な妥当性 ---
+        usable = []
+        for b in candidates:
+            if not b.enabled:
+                res.skip_reasons.append("Allow ボタンが無効状態のため対象外にしました")
+                continue
+            if b.offscreen:
+                res.skip_reasons.append("Allow ボタンが画面外のため対象外にしました")
+                continue
+            if b.pid and b.pid != win.pid:
+                res.skip_reasons.append("Allow ボタンの所有プロセスが Kiro と違うため対象外にしました")
+                continue
+            if not win.contains(b.rect):
+                res.skip_reasons.append("Allow ボタンが Kiro ウィンドウの外にあるため対象外にしました")
+                continue
+            if not _size_ok(b, s):
+                res.skip_reasons.append(
+                    f"Allow ボタンの大きさが想定外（{b.width}x{b.height}）のため対象外にしました"
+                )
+                continue
+            usable.append(b)
+        if not usable:
+            continue
+
+        # --- 同じ承認ブロックに Always allow / Deny が揃っているか ---
+        gtol = int(s["group_vertical_tolerance_px"])
+        rtol = int(s["same_row_tolerance_px"])
+        required = [str(x).lower() for x in s.get("require_sibling_buttons", [])]
+
+        verified: list[ElemInfo] = []
+        for b in usable:
+            group = [
+                o for o in related
+                if abs(o.center_y - b.center_y) <= gtol and win.contains(o.rect)
+            ]
+            group_names = {o.norm_name.lower() for o in group}
+            missing = [r for r in required if r not in group_names]
+            if missing:
+                res.skip_reasons.append(
+                    "承認 UI と確認できませんでした（同じブロックに "
+                    + " / ".join(missing) + " が見つかりません）"
+                )
+                continue
+            res.approval_ui_found = True
+
+            if s.get("require_allow_is_leftmost", True):
+                same_row = [o for o in group if abs(o.center_y - b.center_y) <= rtol]
+                if same_row and b.left > min(o.left for o in same_row):
+                    res.skip_reasons.append(
+                        "Allow が同じ行の一番左ではなかったのでクリックしませんでした"
+                    )
+                    continue
+            verified.append(b)
+
+        if not verified:
+            continue
+
+        # --- 承認メッセージの文字列（確認材料。既定では必須にしない） ---
+        if not res.approval_text:
+            patterns = [str(p).lower() for p in s.get("approval_text_patterns", [])]
+            for t in uia.find_texts(root):
+                low = t.norm_name.lower()
+                if low and any(p in low for p in patterns):
+                    res.approval_text = t.norm_name
+                    break
+        if s.get("require_approval_text", False) and not res.approval_text:
+            res.skip_reasons.append(
+                "承認メッセージの文字列が見つからないためクリックしませんでした"
+            )
+            continue
+
+        # --- 候補が複数のとき ---
+        if len(verified) > 1:
+            mode = str(s.get("on_multiple_candidates", "skip"))
+            if mode == "bottommost":
+                verified.sort(key=lambda b: b.center_y)
+                chosen = verified[-1]
+                res.checks.append(
+                    f"Allow 候補が {len(verified)} 個あったため一番下のものを選びました"
+                )
+            else:
+                res.skip_reasons.append(
+                    f"Allow 候補が {len(verified)} 個見つかり特定できないためクリックしませんでした"
+                )
+                continue
+        else:
+            chosen = verified[0]
+
+        res.checks.append(f"Kiro ウィンドウ {win.describe()}")
+        res.checks.append(
+            f"ボタン名が完全一致（'{chosen.norm_name}'）/ ControlType={chosen.control_type_name}"
+        )
+        res.checks.append(f"座標 {chosen.rect}")
+        res.target = (win, chosen)
+        return res
+
+    return res
+
+
+# =============================================================================
+#  クリック
+# =============================================================================
+
+
+def click_allow(uia: UiaSession, win: WindowInfo, info: ElemInfo, cfg: dict, log: LogBus) -> bool:
+    """クリック直前にもう一度全部確認してから実行する。"""
+    ccfg = cfg["click"]
+    target_name = cfg["target_button_name"]
+    never = {str(x).lower() for x in cfg.get("never_click_names", [])}
+
+    # --- 直前の再確認（ここが最後の砦） ---
+    if not user32.IsWindow(win.hwnd):
+        log.warn("クリック直前に Kiro ウィンドウが消えたため中止しました")
+        return False
+    if os.path.basename(process_image_path(window_pid(win.hwnd))).lower() not in {
+        str(x).lower() for x in cfg["kiro"]["process_names"]
+    }:
+        log.warn("クリック直前のプロセス確認に失敗したため中止しました")
+        return False
+
+    fresh = uia.current_info(info.element)
+    if fresh.norm_name != target_name:
+        log.warn(
+            f"クリック直前にボタン名が変わっていました（'{fresh.norm_name}'）。中止しました"
+        )
+        return False
+    if fresh.norm_name.lower() in never:
+        log.warn("クリック禁止リストに一致したため中止しました")
+        return False
+    if fresh.control_type != UIA_ButtonControlTypeId:
+        log.warn("対象が Button ではなくなっていたため中止しました")
+        return False
+    if not fresh.enabled or fresh.offscreen:
+        log.warn("対象が無効／画面外になっていたため中止しました")
+        return False
+    if fresh.pid and fresh.pid != win.pid:
+        log.warn("対象の所有プロセスが Kiro ではなくなったため中止しました")
+        return False
+    cur_rect = window_rect(win.hwnd)
+    if not WindowInfo(win.hwnd, win.pid, win.title, win.class_name, win.exe_path, cur_rect).contains(fresh.rect):
+        log.warn("対象が Kiro ウィンドウの外に出たため中止しました")
+        return False
+
+    def gone() -> bool:
+        """押せたかどうかを実際に確認する。要素が消える／無効になれば成功。"""
+        time.sleep(0.7)
+        try:
+            nm = normalize_name(fresh.element.CurrentName)
+            off = bool(fresh.element.CurrentIsOffscreen)
+            en = bool(fresh.element.CurrentIsEnabled)
+        except Exception:
+            return True  # 要素自体が無くなった＝押せた
+        return not (nm == target_name and en and not off)
+
+    # --- 1) Invoke（マウスを動かさない。最も安全） ---
+    if ccfg.get("use_invoke", True):
+        if uia.invoke(fresh.element):
+            if gone():
+                log.ok("Allow をクリックしました（UI Automation / Invoke）")
+                return True
+            log.warn("Invoke は実行できましたが承認 UI が残っています。別の方法を試します")
+        else:
+            log.warn("Invoke パターンを使えませんでした。別の方法を試します")
+
+    # --- 2) LegacyIAccessible の既定アクション ---
+    if ccfg.get("use_legacy_default_action", True):
+        if uia.legacy_default_action(fresh.element):
+            if gone():
+                log.ok("Allow をクリックしました（UI Automation / DoDefaultAction）")
+                return True
+            log.warn("DoDefaultAction でも承認 UI が残っています。別の方法を試します")
+
+    # --- 3) 物理クリック（最後の手段） ---
+    if not ccfg.get("allow_mouse_fallback", True):
+        log.warn("UI Automation でクリックできず、物理クリックは無効設定のため見送りました")
+        return False
+    if ccfg.get("mouse_requires_foreground", True):
+        if int(user32.GetForegroundWindow()) != win.hwnd:
+            log.warn(
+                "UI Automation でクリックできず、Kiro が最前面でないため物理クリックを見送りました"
+            )
+            return False
+    x, y = fresh.center
+    if physical_left_click(x, y, bool(ccfg.get("restore_cursor", True))):
+        if gone():
+            log.ok(f"Allow をクリックしました（物理クリック {x},{y}）")
+            return True
+        log.error("物理クリックを実行しましたが承認 UI が残っています")
+        return False
+    log.error("クリックに失敗しました")
+    return False
+
+
+# =============================================================================
+#  UI 要素ダンプ（デバッグ用）
+# =============================================================================
+
+
+def dump_ui(cfg: dict, log: LogBus) -> Path | None:
+    """Kiro から取得できる UI 要素をファイルに書き出す。"""
+    try:
+        uia = UiaSession()
+    except Exception as e:
+        log.error(f"UI Automation を初期化できませんでした: {e}")
+        return None
+
+    wins = find_kiro_windows(cfg)
+    if not wins:
+        log.warn("Kiro のウィンドウが見つかりません。Kiro を起動してから実行してください")
+        return None
+
+    dcfg = cfg["dump"]
+    max_depth = int(dcfg["max_depth"])
+    max_nodes = int(dcfg["max_nodes"])
+    lines: list[str] = []
+    lines.append(f"{APP_NAME} {APP_VERSION} UI 要素ダンプ")
+    lines.append(f"日時: {datetime.now():%Y-%m-%d %H:%M:%S}")
+    lines.append("")
+
+    for win in wins:
+        lines.append("=" * 100)
+        lines.append(f"ウィンドウ名   : {win.title}")
+        lines.append(f"ウィンドウ handle: 0x{win.hwnd:X}")
+        lines.append(f"クラス名        : {win.class_name}")
+        lines.append(f"PID / 実行ファイル: {win.pid} / {win.exe_path}")
+        lines.append(f"ウィンドウ座標  : {win.rect}")
+        lines.append("=" * 100)
+
+        try:
+            root = uia.element_from_handle(win.hwnd)
+        except Exception as e:
+            lines.append(f"  UI 要素を取得できませんでした: {e}")
+            continue
+
+        # --- 1) ボタン一覧（承認 UI の確認に一番役立つ） ---
+        buttons = uia.find_buttons(root)
+        lines.append("")
+        lines.append(f"--- Button 一覧 ({len(buttons)} 個) ---")
+        for b in buttons:
+            mark = ""
+            low = b.norm_name.lower()
+            if low in APPROVAL_NAMES_LOWER:
+                mark = "  <<< 承認 UI 関連"
+            if b.norm_name == cfg["target_button_name"]:
+                mark = "  <<< クリック対象候補（完全一致）"
+            lines.append(
+                f"  Name='{b.norm_name}' ControlType={b.control_type_name} "
+                f"AutomationId='{b.automation_id}' Class='{b.class_name}' "
+                f"Rect={b.rect} Enabled={b.enabled} Offscreen={b.offscreen} "
+                f"Invokable={b.invokable} Pid={b.pid}{mark}"
+            )
+
+        # --- 2) 承認メッセージらしいテキスト ---
+        patterns = [str(p).lower() for p in cfg["safety"]["approval_text_patterns"]]
+        texts = uia.find_texts(root)
+        hits = [t for t in texts if t.norm_name and any(p in t.norm_name.lower() for p in patterns)]
+        lines.append("")
+        lines.append(f"--- 承認メッセージ候補 ({len(hits)} 件 / Text 要素 {len(texts)} 個) ---")
+        for t in hits[:20]:
+            lines.append(f"  '{t.norm_name}' Rect={t.rect}")
+
+        # --- 3) ツリー全体 ---
+        lines.append("")
+        lines.append(f"--- UI ツリー (最大深さ {max_depth} / 最大 {max_nodes} ノード) ---")
+        count = 0
+
+        def walk(el, depth: int, parent_desc: str) -> None:
+            nonlocal count
+            if el is None or depth > max_depth or count >= max_nodes:
+                return
+            info = uia.current_info(el)
+            count += 1
+            pad = "  " * depth
+            lines.append(
+                f"{pad}[{depth}] {info.control_type_name} Name='{info.norm_name}' "
+                f"AutomationId='{info.automation_id}' Class='{info.class_name}' "
+                f"Rect={info.rect} Enabled={info.enabled} Offscreen={info.offscreen}"
+            )
+            lines.append(f"{pad}     親: {parent_desc}")
+            me = f"{info.control_type_name}'{info.norm_name}'"
+            child = uia.first_child(el)
+            while child is not None and count < max_nodes:
+                walk(child, depth + 1, me)
+                child = uia.next_sibling(child)
+
+        try:
+            walk(root, 0, "(なし＝ウィンドウ自身)")
+        except Exception as e:
+            lines.append(f"  ツリー走査中にエラー: {e}")
+        lines.append(f"--- ノード数 {count} ---")
+
+    path = dumps_dir() / f"ui_dump_{datetime.now():%Y%m%d_%H%M%S}.txt"
+    try:
+        path.write_text("\n".join(lines), encoding="utf-8")
+    except Exception as e:
+        log.error(f"ダンプの保存に失敗しました: {e}")
+        return None
+
+    log.ok(f"UI 要素を書き出しました: {path}")
+    if dcfg.get("open_after_dump", True):
+        try:
+            os.startfile(str(path))  # noqa: S606
+        except Exception:
+            pass
+    return path
+
+
+# =============================================================================
+#  監視スレッド
+# =============================================================================
+
+
+class AppState:
+    def __init__(self, cfg: dict) -> None:
+        self.auto_allow = bool(cfg["ui"]["auto_allow_default"])
+        self.test_mode = bool(cfg["ui"]["test_mode_default"])
+        self.click_count = 0
+        self.detect_count = 0
+        self.kiro_found = False
+        self.last_error = ""
+
+
+class Monitor(threading.Thread):
+    daemon = True
+
+    def __init__(self, cfg: dict, state: AppState, log: LogBus,
+                 on_emergency_stop) -> None:
+        super().__init__(name="KiroAutoAllowMonitor", daemon=True)
+        self.cfg = cfg
+        self.state = state
+        self.log = log
+        self.on_emergency_stop = on_emergency_stop
+        self._stop = threading.Event()
+        self._clicks = deque(maxlen=120)
+        self._clicked_keys: dict[str, float] = {}
+        self._test_logged: dict[str, float] = {}
+        self._cooldown_until = 0.0
+        self._last_kiro_found: bool | None = None
+        self._last_approval_key = ""
+        self._no_click_logged: set[str] = set()
+        self._last_test_mode: bool | None = None
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def reset_dedupe(self) -> None:
+        """ON/OFF やモード切り替え時に「処理済み」の記録を捨てる。
+
+        これをしないと、テストモードで見送った承認画面が
+        モードを切り替えた直後にクリックされない。
+        """
+        self._clicked_keys.clear()
+        self._test_logged.clear()
+        self._no_click_logged.clear()
+        self._last_approval_key = ""
+        self._cooldown_until = 0.0
+
+    # ------------------------------------------------------------------ 本体
+    def run(self) -> None:
+        try:
+            uia = UiaSession()
+        except Exception as e:
+            self.log.error(f"UI Automation を初期化できませんでした: {e}")
+            self.state.last_error = str(e)
+            return
+
+        esc = DoubleEscWatcher(int(self.cfg["emergency"]["double_esc_window_ms"]))
+        use_esc = bool(self.cfg["emergency"]["double_esc"])
+        interval = float(self.cfg["poll_interval_sec"])
+        next_scan = 0.0
+
+        while not self._stop.is_set():
+            # 緊急停止の監視は ON/OFF に関係なく回す
+            if use_esc and esc.poll() and self.state.auto_allow:
+                self.log.warn("Esc 2 回押しを検知したため緊急停止しました")
+                self.on_emergency_stop()
+
+            if self._last_test_mode is None:
+                self._last_test_mode = self.state.test_mode
+            elif self._last_test_mode != self.state.test_mode:
+                self._last_test_mode = self.state.test_mode
+                self.reset_dedupe()
+
+            if not self.state.auto_allow:
+                self._last_kiro_found = None
+                time.sleep(0.05)
+                continue
+
+            now = time.monotonic()
+            if now < next_scan or now < self._cooldown_until:
+                time.sleep(0.05)
+                continue
+            next_scan = now + interval
+
+            try:
+                self._tick(uia)
+            except Exception as e:
+                self.log.error(f"監視中にエラーが発生しました: {e}")
+                time.sleep(1.0)
+
+    def _tick(self, uia: UiaSession) -> None:
+        res = scan(uia, self.cfg)
+
+        # --- Kiro の検出状況 ---
+        found = bool(res.windows)
+        self.state.kiro_found = found
+        if found != self._last_kiro_found:
+            self._last_kiro_found = found
+            if found:
+                self.log.info(
+                    "Kiro を検出しました: "
+                    + " / ".join(w.describe() for w in res.windows[:3])
+                )
+            else:
+                self.log.warn("Kiro のウィンドウが見つかりません")
+        if not found:
+            return
+
+        # --- 承認 UI 関連ボタンのログ（同じ画面で繰り返し出さない） ---
+        if res.approval_buttons:
+            key = "|".join(
+                sorted(f"{b.norm_name}@{b.rect}" for _, b in res.approval_buttons)
+            )
+            if key != self._last_approval_key:
+                self._last_approval_key = key
+                self.log.detect("承認画面を検出しました")
+                if res.approval_text:
+                    self.log.info(f"承認メッセージ: {res.approval_text}")
+                for _w, b in res.approval_buttons:
+                    self.log.info(
+                        f"検出したボタン：{b.norm_name}"
+                        f"（ControlType={b.control_type_name} Rect={b.rect}）"
+                    )
+        else:
+            self._last_approval_key = ""
+
+        # --- クリック対象 ---
+        if res.target is None:
+            if res.skip_reasons:
+                for reason in dict.fromkeys(res.skip_reasons):
+                    if reason not in self._no_click_logged:
+                        self._no_click_logged.add(reason)
+                        self.log.warn(f"検出しましたがクリックしませんでした: {reason}")
+            return
+
+        self._no_click_logged.clear()
+        win, btn = res.target
+
+        # --- 同じボタンを二重に処理しない（ログも出さない） ---
+        k = btn.key()
+        now = time.monotonic()
+        self._clicked_keys = {
+            kk: tt for kk, tt in self._clicked_keys.items() if now - tt < 30.0
+        }
+        self._test_logged = {
+            kk: tt for kk, tt in self._test_logged.items() if now - tt < 30.0
+        }
+        if k in self._clicked_keys:
+            return
+        if self.state.test_mode and k in self._test_logged:
+            return
+
+        self.state.detect_count += 1
+        self.log.detect(f"Allow ボタンを検出しました（{btn.rect}）")
+        for c in res.checks:
+            self.log.info(f"確認: {c}")
+
+        # --- テストモード ---
+        if self.state.test_mode:
+            self.log.ok("クリック対象確認 OK")
+            self.log.warn(
+                "テストモードのためクリックしませんでした"
+                "（実際に押すには [テストモード: OFF] にしてください）"
+            )
+            # _clicked_keys には入れない。入れるとテストモードを OFF にした直後に押せなくなる。
+            self._test_logged[k] = now
+            return
+
+        # --- 暴走検知 ---
+        limit = int(self.cfg["max_clicks_per_minute"])
+        recent = [t for t in self._clicks if now - t < 60.0]
+        if len(recent) >= limit:
+            self.log.error(
+                f"1 分間に {limit} 回を超えるクリックを検知したため安全のため停止しました"
+            )
+            self.on_emergency_stop()
+            return
+
+        self.log.ok("クリック対象確認 OK")
+        if click_allow(uia, win, btn, self.cfg, self.log):
+            self.state.click_count += 1
+            self._clicks.append(now)
+            self._clicked_keys[k] = now
+        self._cooldown_until = time.monotonic() + float(self.cfg["post_click_cooldown_sec"])
+
+
+# =============================================================================
+#  GUI
+# =============================================================================
+
+LEVEL_COLORS = {
+    INFO: "#d4d4d4",
+    OK: "#4ec9b0",
+    WARN: "#dcdcaa",
+    ERROR: "#f48771",
+    DETECT: "#569cd6",
+}
+
+
+class App:
+    def __init__(self) -> None:
+        self.cfg = load_config()
+        self.log = LogBus()
+        self.state = AppState(self.cfg)
+
+        self.root = tk.Tk()
+        self.root.title(f"{APP_NAME} {APP_VERSION}")
+        self.root.geometry("760x560")
+        self.root.minsize(660, 460)
+        if self.cfg["ui"].get("always_on_top"):
+            self.root.attributes("-topmost", True)
+
+        try:
+            dpi = self.root.winfo_fpixels("1i")
+            self.root.tk.call("tk", "scaling", dpi / 72.0)
+        except Exception:
+            pass
+
+        self._build()
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        self.monitor = Monitor(self.cfg, self.state, self.log, self._emergency_stop)
+        self.monitor.start()
+
+        self.log.info(f"{APP_NAME} {APP_VERSION} を起動しました")
+        self.log.info(f"設定ファイル: {config_path()}")
+        self.log.info(
+            "クリック対象は Kiro の承認 UI 内で名前が完全一致する "
+            f"'{self.cfg['target_button_name']}' だけです"
+        )
+        self.log.info("Always allow / Deny / Always deny / Cancel はクリックしません")
+        if self.state.test_mode:
+            self.log.warn("テストモードが ON です。検出しても実際にはクリックしません")
+
+        self._pump()
+
+    # ------------------------------------------------------------------ 画面
+    def _build(self) -> None:
+        bg = "#1e1e1e"
+        self.root.configure(bg=bg)
+
+        head = tk.Frame(self.root, bg=bg)
+        head.pack(fill="x", padx=12, pady=(12, 6))
+
+        self.btn_auto = tk.Button(
+            head, text="Auto Allow: OFF", width=20, height=2,
+            font=("Segoe UI", 12, "bold"), relief="raised",
+            command=self._toggle_auto,
+        )
+        self.btn_auto.pack(side="left")
+
+        self.btn_test = tk.Button(
+            head, text="テストモード: ON", width=20, height=2,
+            font=("Segoe UI", 12, "bold"), relief="raised",
+            command=self._toggle_test,
+        )
+        self.btn_test.pack(side="left", padx=(10, 0))
+
+        self.btn_stop = tk.Button(
+            head, text="緊急停止", width=12, height=2,
+            font=("Segoe UI", 12, "bold"), bg="#8b1a1a", fg="white",
+            activebackground="#a52020", activeforeground="white",
+            command=self._emergency_stop_from_gui,
+        )
+        self.btn_stop.pack(side="right")
+
+        info = tk.Frame(self.root, bg=bg)
+        info.pack(fill="x", padx=12, pady=(0, 6))
+
+        self.lbl_state = tk.Label(
+            info, text="", bg=bg, fg="#d4d4d4", font=("Segoe UI", 10), anchor="w",
+            justify="left",
+        )
+        self.lbl_state.pack(side="left")
+
+        tools = tk.Frame(self.root, bg=bg)
+        tools.pack(fill="x", padx=12, pady=(0, 6))
+        tk.Button(tools, text="今すぐ1回だけ実行", command=self._run_once).pack(side="left")
+        tk.Button(tools, text="UI要素を確認", command=self._dump_ui).pack(side="left", padx=6)
+        tk.Button(tools, text="ログを消去", command=self._clear_log).pack(side="left", padx=6)
+        tk.Button(tools, text="保存フォルダを開く", command=self._open_folder).pack(side="left")
+
+        logf = tk.Frame(self.root, bg=bg)
+        logf.pack(fill="both", expand=True, padx=12, pady=(0, 6))
+        self.txt = tk.Text(
+            logf, bg="#141414", fg="#d4d4d4", insertbackground="#d4d4d4",
+            font=("Consolas", 10), wrap="word", state="disabled", borderwidth=0,
+        )
+        sb = ttk.Scrollbar(logf, orient="vertical", command=self.txt.yview)
+        self.txt.configure(yscrollcommand=sb.set)
+        self.txt.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+        for lv, col in LEVEL_COLORS.items():
+            self.txt.tag_configure(lv, foreground=col)
+
+        tk.Label(
+            self.root,
+            text="緊急停止: 画面の[緊急停止]ボタン、または Esc を素早く2回押す",
+            bg=bg, fg="#888888", font=("Segoe UI", 9), anchor="w",
+        ).pack(fill="x", padx=12, pady=(0, 10))
+
+        self._refresh_labels()
+
+    # ------------------------------------------------------------------ 操作
+    def _toggle_auto(self) -> None:
+        self.state.auto_allow = not self.state.auto_allow
+        self.monitor.reset_dedupe()
+        if self.state.auto_allow:
+            self.log.ok("Auto Allow を開始しました")
+            if self.state.test_mode:
+                self.log.warn("テストモードのため実際のクリックは行いません")
+        else:
+            self.log.info("Auto Allow を停止しました")
+        self._refresh_labels()
+
+    def _toggle_test(self) -> None:
+        self.state.test_mode = not self.state.test_mode
+        self.monitor.reset_dedupe()
+        if self.state.test_mode:
+            self.log.warn("テストモードを ON にしました（検出してもクリックしません）")
+        else:
+            self.log.warn("テストモードを OFF にしました（実際にクリックします）")
+        self._refresh_labels()
+
+    def _emergency_stop_from_gui(self) -> None:
+        if self.state.auto_allow:
+            self.log.warn("緊急停止しました")
+        self.state.auto_allow = False
+        self._refresh_labels()
+
+    def _emergency_stop(self) -> None:
+        self.state.auto_allow = False
+        self.root.after(0, self._refresh_labels)
+
+    def _dump_ui(self) -> None:
+        self.log.info("UI 要素を取得します…")
+        threading.Thread(
+            target=lambda: dump_ui(self.cfg, self.log), daemon=True
+        ).start()
+
+    def _run_once(self) -> None:
+        """自動監視とは別に、その場で 1 回だけ検出→クリックを試す。"""
+        self.log.info("手動実行: いま表示されている承認画面を 1 回だけ処理します")
+        threading.Thread(target=self._run_once_worker, daemon=True).start()
+
+    def _run_once_worker(self) -> None:
+        try:
+            uia = UiaSession()
+        except Exception as e:
+            self.log.error(f"UI Automation を初期化できませんでした: {e}")
+            return
+        res = scan(uia, self.cfg)
+        if not res.windows:
+            self.log.warn("Kiro のウィンドウが見つかりません")
+            return
+        self.log.info(
+            "Kiro を検出しました: " + " / ".join(w.describe() for w in res.windows[:3])
+        )
+        if res.approval_buttons:
+            self.log.detect("承認画面を検出しました")
+            if res.approval_text:
+                self.log.info(f"承認メッセージ: {res.approval_text}")
+            for _w, b in res.approval_buttons:
+                self.log.info(
+                    f"検出したボタン：{b.norm_name}"
+                    f"（ControlType={b.control_type_name} Rect={b.rect}）"
+                )
+        else:
+            self.log.warn("承認画面は表示されていません")
+        if res.target is None:
+            for reason in dict.fromkeys(res.skip_reasons):
+                self.log.warn(f"クリックしませんでした: {reason}")
+            return
+        win, btn = res.target
+        self.log.detect(f"Allow ボタンを検出しました（{btn.rect}）")
+        for c in res.checks:
+            self.log.info(f"確認: {c}")
+        if self.state.test_mode:
+            self.log.ok("クリック対象確認 OK")
+            self.log.warn(
+                "テストモードのためクリックしませんでした"
+                "（実際に押すには [テストモード: OFF] にしてください）"
+            )
+            return
+        self.log.ok("クリック対象確認 OK")
+        if click_allow(uia, win, btn, self.cfg, self.log):
+            self.state.click_count += 1
+            self.monitor.reset_dedupe()
+
+    def _clear_log(self) -> None:
+        self.txt.configure(state="normal")
+        self.txt.delete("1.0", "end")
+        self.txt.configure(state="disabled")
+
+    def _open_folder(self) -> None:
+        try:
+            os.startfile(str(app_data_dir()))  # noqa: S606
+        except Exception as e:
+            self.log.error(f"フォルダを開けませんでした: {e}")
+
+    def _on_close(self) -> None:
+        self.state.auto_allow = False
+        self.monitor.stop()
+        self.root.after(120, self.root.destroy)
+
+    # ------------------------------------------------------------------ 表示
+    def _refresh_labels(self) -> None:
+        on = self.state.auto_allow
+        test = self.state.test_mode
+        self.btn_auto.configure(
+            text=f"Auto Allow: {'ON' if on else 'OFF'}",
+            bg="#0e639c" if on else "#3a3a3a",
+            fg="white",
+            activebackground="#1177bb" if on else "#4a4a4a",
+            activeforeground="white",
+        )
+        self.btn_test.configure(
+            text=f"テストモード: {'ON' if test else 'OFF'}",
+            bg="#a06000" if test else "#3a3a3a",
+            fg="white",
+            activebackground="#c07800" if test else "#4a4a4a",
+            activeforeground="white",
+        )
+        if not on:
+            status = "現在の状態: 停止中（何もしません）"
+        elif test:
+            status = "現在の状態: 監視中（テストモード：クリックしません）"
+        else:
+            status = "現在の状態: 監視中（Allow を自動クリックします）"
+        kiro = "検出中" if self.state.kiro_found else "未検出"
+        self.lbl_state.configure(
+            text=(
+                f"{status}\n"
+                f"Kiro: {kiro}    Allow クリック回数: {self.state.click_count}    "
+                f"Allow 検出回数: {self.state.detect_count}"
+            )
+        )
+
+    def _pump(self) -> None:
+        rows = self.log.drain()
+        if rows:
+            self.txt.configure(state="normal")
+            for stamp, msg, level in rows:
+                self.txt.insert("end", f"{stamp} {msg}\n", level)
+            limit = int(self.cfg["ui"]["max_log_lines"])
+            total = int(self.txt.index("end-1c").split(".")[0])
+            if total > limit:
+                self.txt.delete("1.0", f"{total - limit}.0")
+            self.txt.configure(state="disabled")
+            self.txt.see("end")
+        self._refresh_labels()
+        self.root.after(150, self._pump)
+
+    def run(self) -> int:
+        self.root.mainloop()
+        return 0
+
+
+def main() -> int:
+    enable_dpi_awareness()
+    try:
+        return App().run()
+    except Exception as e:
+        try:
+            import tkinter.messagebox as mb
+
+            mb.showerror(APP_NAME, f"起動に失敗しました:\n{e}")
+        except Exception:
+            print(f"起動に失敗しました: {e}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

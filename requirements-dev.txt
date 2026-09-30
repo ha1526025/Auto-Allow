@@ -1,0 +1,3 @@
+# .exe をビルドするときだけ必要
+-r requirements.txt
+pyinstaller>=6.16.0
