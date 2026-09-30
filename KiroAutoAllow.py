@@ -105,11 +105,32 @@ DEFAULTS: dict[str, Any] = {
         "allow_mouse_fallback": True,
         "mouse_requires_foreground": True,
         "restore_cursor": True,
+        # クリックで Kiro が前面に出てきてしまう場合、元のウィンドウに戻す
+        "keep_foreground": True,
+    },
+
+    # --- 「次のプロンプトを送れる状態」の通知 ---
+    "notify": {
+        "enabled": True,
+        # Kiro が処理中のあいだ表示される要素（完全一致で判定）
+        "busy_text_names": ["Working"],
+        "busy_button_names": ["Cancel"],
+        # 処理中の表示が消えてからこの秒数だけ変化がなければ「完了」とみなす
+        "ready_idle_sec": 2.0,
+        "sound": True,
+        "flash_taskbar": True,
+        # 完了したときだけウィンドウを最前面に出す（常時固定はしない）
+        "bring_to_front": True,
+        # 最前面を維持する秒数。経過後に自動で解除する
+        "front_seconds": 5.0,
+        # フォーカスも奪うか。Windows の制限で失敗することが多く、
+        # 作業中のキー入力を取られると困るので既定は False。
+        # False でも最前面には出るので通知には気付ける。
+        "focus_window": False,
     },
     "emergency": {"double_esc": True, "double_esc_window_ms": 600},
     "ui": {
         "auto_allow_default": False,
-        "test_mode_default": True,
         "max_log_lines": 800,
         "always_on_top": False,
     },
@@ -325,6 +346,124 @@ def physical_left_click(x: int, y: int, restore: bool = True) -> bool:
         time.sleep(0.03)
         user32.SetCursorPos(old[0], old[1])
     return sent == 2
+
+
+user32.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
+user32.GetAncestor.restype = wintypes.HWND
+user32.IsIconic.argtypes = [wintypes.HWND]
+user32.IsIconic.restype = wintypes.BOOL
+user32.GetParent.argtypes = [wintypes.HWND]
+user32.GetParent.restype = wintypes.HWND
+user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+
+GA_ROOT = 2
+SW_RESTORE = 9
+
+
+def root_hwnd(hwnd: int) -> int:
+    """tkinter の winfo_id() は子ウィンドウを返すことがあるので、実体の
+    トップレベルウィンドウのハンドルに変換する。"""
+    try:
+        top = user32.GetAncestor(hwnd, GA_ROOT)
+        return int(top) if top else hwnd
+    except Exception:
+        return hwnd
+
+
+def restore_if_minimized(hwnd: int) -> None:
+    try:
+        if user32.IsIconic(hwnd):
+            user32.ShowWindow(hwnd, SW_RESTORE)
+    except Exception:
+        pass
+
+
+user32.AttachThreadInput.argtypes = [wintypes.DWORD, wintypes.DWORD, wintypes.BOOL]
+user32.AttachThreadInput.restype = wintypes.BOOL
+user32.SetForegroundWindow.argtypes = [wintypes.HWND]
+user32.SetForegroundWindow.restype = wintypes.BOOL
+user32.BringWindowToTop.argtypes = [wintypes.HWND]
+user32.MessageBeep.argtypes = [wintypes.UINT]
+kernel32.GetCurrentThreadId.restype = wintypes.DWORD
+
+MB_ICONASTERISK = 0x00000040
+
+
+def foreground_window() -> int:
+    """前面ウィンドウ。無いときは 0。
+
+    ウィンドウ切り替えの瞬間などに NULL が返るため、必ず None を潰す。
+    """
+    h = user32.GetForegroundWindow()
+    return int(h) if h else 0
+
+
+def restore_foreground(hwnd: int) -> bool:
+    """指定ウィンドウを前面に戻す。
+
+    Windows は勝手な前面化を制限しているため、いまの前面ウィンドウの
+    入力スレッドに一時的に相乗り（AttachThreadInput）してから要求する。
+    """
+    if not hwnd or not user32.IsWindow(hwnd):
+        return False
+    cur = foreground_window()
+    if cur == hwnd:
+        return True
+    our = kernel32.GetCurrentThreadId()
+    target_thread = wintypes.DWORD(0)
+    if cur:
+        user32.GetWindowThreadProcessId(cur, ctypes.byref(target_thread))
+    attached = False
+    try:
+        if target_thread.value and target_thread.value != our:
+            attached = bool(user32.AttachThreadInput(our, target_thread.value, True))
+        user32.BringWindowToTop(hwnd)
+        user32.SetForegroundWindow(hwnd)
+    except Exception:
+        return False
+    finally:
+        if attached:
+            try:
+                user32.AttachThreadInput(our, target_thread.value, False)
+            except Exception:
+                pass
+    return foreground_window() == hwnd
+
+
+class _FLASHWINFO(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", wintypes.UINT),
+        ("hwnd", wintypes.HWND),
+        ("dwFlags", wintypes.DWORD),
+        ("uCount", wintypes.UINT),
+        ("dwTimeout", wintypes.DWORD),
+    ]
+
+
+user32.FlashWindowEx.argtypes = [ctypes.POINTER(_FLASHWINFO)]
+user32.FlashWindowEx.restype = wintypes.BOOL
+
+FLASHW_ALL = 0x00000003
+FLASHW_TIMERNOFG = 0x0000000C
+
+
+def flash_window(hwnd: int, count: int = 6) -> None:
+    """タスクバーを点滅させて知らせる（フォーカスは奪わない）。"""
+    try:
+        fi = _FLASHWINFO(
+            ctypes.sizeof(_FLASHWINFO), wintypes.HWND(hwnd),
+            FLASHW_ALL | FLASHW_TIMERNOFG, count, 0,
+        )
+        user32.FlashWindowEx(ctypes.byref(fi))
+    except Exception:
+        pass
+
+
+def notify_beep() -> None:
+    try:
+        user32.MessageBeep(MB_ICONASTERISK)
+    except Exception:
+        pass
 
 
 class DoubleEscWatcher:
@@ -758,6 +897,9 @@ class ScanResult:
     target: tuple[WindowInfo, ElemInfo] | None = None
     checks: list[str] = field(default_factory=list)
     skip_reasons: list[str] = field(default_factory=list)
+    # Kiro が処理中かどうか（"Working" 表示などで判定）
+    busy: bool = False
+    busy_reason: str = ""
 
 
 def _size_ok(b: ElemInfo, s: dict) -> bool:
@@ -767,17 +909,24 @@ def _size_ok(b: ElemInfo, s: dict) -> bool:
     )
 
 
-def scan(uia: UiaSession, cfg: dict) -> ScanResult:
-    """Kiro の承認 UI を探し、クリックしてよい Allow ボタンを 1 つだけ決める。"""
+def scan(uia: UiaSession, cfg: dict, check_busy: bool = False) -> ScanResult:
+    """Kiro の承認 UI を探し、クリックしてよい Allow ボタンを 1 つだけ決める。
+
+    check_busy=True のときは、あわせて「Kiro が処理中か」も判定する。
+    """
     res = ScanResult()
     s = cfg["safety"]
     target_name = cfg["target_button_name"]
     never = {str(x).lower() for x in cfg.get("never_click_names", [])}
+    ncfg = cfg.get("notify", {})
+    busy_texts = {normalize_name(x) for x in ncfg.get("busy_text_names", [])}
+    busy_buttons = {normalize_name(x) for x in ncfg.get("busy_button_names", [])}
 
     res.windows = find_kiro_windows(cfg)
     if not res.windows:
         return res
 
+    target_found = False
     for win in res.windows:
         try:
             root = uia.element_from_handle(win.hwnd)
@@ -788,7 +937,22 @@ def scan(uia: UiaSession, cfg: dict) -> ScanResult:
             continue
 
         buttons = uia.find_buttons(root)
-        if not buttons:
+
+        # --- Kiro が処理中か（完全一致で判定する。チャット本文に拾われないように） ---
+        if check_busy and not res.busy:
+            for b in buttons:
+                if b.norm_name in busy_buttons and b.enabled and not b.offscreen:
+                    res.busy = True
+                    res.busy_reason = f"ボタン '{b.norm_name}' が表示されています"
+                    break
+            if not res.busy and busy_texts:
+                for t in uia.find_texts(root):
+                    if t.norm_name in busy_texts and not t.offscreen:
+                        res.busy = True
+                        res.busy_reason = f"'{t.norm_name}' が表示されています"
+                        break
+
+        if not buttons or target_found:
             continue
 
         # --- 承認 UI 関連のボタンを拾う（ログ用） ---
@@ -897,7 +1061,9 @@ def scan(uia: UiaSession, cfg: dict) -> ScanResult:
         )
         res.checks.append(f"座標 {chosen.rect}")
         res.target = (win, chosen)
-        return res
+        target_found = True
+        if not check_busy:
+            return res
 
     return res
 
@@ -946,6 +1112,27 @@ def click_allow(uia: UiaSession, win: WindowInfo, info: ElemInfo, cfg: dict, log
         log.warn("対象が Kiro ウィンドウの外に出たため中止しました")
         return False
 
+    # クリックで Kiro が前面に出てくることがあるので、元の前面ウィンドウを覚えておく
+    prev_fg = foreground_window()
+    keep_fg = bool(ccfg.get("keep_foreground", True)) and prev_fg != win.hwnd
+
+    def restore_fg() -> None:
+        """クリック後に元のウィンドウへ戻す。
+
+        Kiro は実行開始のタイミングでも前面化してくるので、少し待って複数回試す。
+        """
+        if not keep_fg:
+            return
+        for delay in (0.05, 0.35, 0.9):
+            time.sleep(delay)
+            if foreground_window() == prev_fg:
+                continue
+            if restore_foreground(prev_fg):
+                log.info("元のウィンドウにフォーカスを戻しました")
+                return
+        if foreground_window() != prev_fg:
+            log.warn("元のウィンドウへフォーカスを戻せませんでした")
+
     def gone() -> bool:
         """押せたかどうかを実際に確認する。要素が消える／無効になれば成功。"""
         time.sleep(0.7)
@@ -962,6 +1149,7 @@ def click_allow(uia: UiaSession, win: WindowInfo, info: ElemInfo, cfg: dict, log
         if uia.invoke(fresh.element):
             if gone():
                 log.ok("Allow をクリックしました（UI Automation / Invoke）")
+                restore_fg()
                 return True
             log.warn("Invoke は実行できましたが承認 UI が残っています。別の方法を試します")
         else:
@@ -972,6 +1160,7 @@ def click_allow(uia: UiaSession, win: WindowInfo, info: ElemInfo, cfg: dict, log
         if uia.legacy_default_action(fresh.element):
             if gone():
                 log.ok("Allow をクリックしました（UI Automation / DoDefaultAction）")
+                restore_fg()
                 return True
             log.warn("DoDefaultAction でも承認 UI が残っています。別の方法を試します")
 
@@ -989,6 +1178,7 @@ def click_allow(uia: UiaSession, win: WindowInfo, info: ElemInfo, cfg: dict, log
     if physical_left_click(x, y, bool(ccfg.get("restore_cursor", True))):
         if gone():
             log.ok(f"Allow をクリックしました（物理クリック {x},{y}）")
+            restore_fg()
             return True
         log.error("物理クリックを実行しましたが承認 UI が残っています")
         return False
@@ -1118,7 +1308,9 @@ def dump_ui(cfg: dict, log: LogBus) -> Path | None:
 class AppState:
     def __init__(self, cfg: dict) -> None:
         self.auto_allow = bool(cfg["ui"]["auto_allow_default"])
-        self.test_mode = bool(cfg["ui"]["test_mode_default"])
+        self.notify_enabled = bool(cfg["notify"]["enabled"])
+        self.kiro_busy = False
+        self.ready_pending = False   # 「送信できます」を GUI に出しているか
         self.click_count = 0
         self.detect_count = 0
         self.kiro_found = False
@@ -1129,36 +1321,77 @@ class Monitor(threading.Thread):
     daemon = True
 
     def __init__(self, cfg: dict, state: AppState, log: LogBus,
-                 on_emergency_stop) -> None:
+                 on_emergency_stop, on_ready=None) -> None:
         super().__init__(name="KiroAutoAllowMonitor", daemon=True)
         self.cfg = cfg
         self.state = state
         self.log = log
         self.on_emergency_stop = on_emergency_stop
+        self.on_ready = on_ready
+        self._seen_busy = False
+        self._idle_since: float | None = None
+        self._notified = True   # 起動直後にいきなり通知しない
         self._stop = threading.Event()
         self._clicks = deque(maxlen=120)
         self._clicked_keys: dict[str, float] = {}
-        self._test_logged: dict[str, float] = {}
         self._cooldown_until = 0.0
         self._last_kiro_found: bool | None = None
         self._last_approval_key = ""
         self._no_click_logged: set[str] = set()
-        self._last_test_mode: bool | None = None
 
     def stop(self) -> None:
         self._stop.set()
 
     def reset_dedupe(self) -> None:
-        """ON/OFF やモード切り替え時に「処理済み」の記録を捨てる。
+        """ON/OFF 切り替え時に「処理済み」の記録を捨てる。
 
-        これをしないと、テストモードで見送った承認画面が
-        モードを切り替えた直後にクリックされない。
+        これをしないと、OFF 中に出ていた承認画面を
+        ON にした直後にクリックできない。
         """
         self._clicked_keys.clear()
-        self._test_logged.clear()
         self._no_click_logged.clear()
         self._last_approval_key = ""
         self._cooldown_until = 0.0
+
+    # -------------------------------------------------- 送信可能になったら通知
+    def _update_ready(self, res: ScanResult) -> None:
+        """Kiro の処理中表示が消えて落ち着いたら 1 回だけ通知する。"""
+        ncfg = self.cfg["notify"]
+        idle_need = float(ncfg.get("ready_idle_sec", 2.0))
+        now = time.monotonic()
+        self.state.kiro_busy = res.busy
+
+        if res.busy:
+            if not self._seen_busy:
+                self.log.info(f"Kiro が処理中です（{res.busy_reason}）")
+            self._seen_busy = True
+            self._idle_since = None
+            self._notified = False
+            if self.state.ready_pending:
+                self.state.ready_pending = False
+            return
+
+        # 承認待ちが残っているあいだは「完了」にしない
+        if res.target is not None or res.approval_buttons:
+            self._idle_since = None
+            return
+
+        if self._idle_since is None:
+            self._idle_since = now
+        if self._notified or not self._seen_busy:
+            return
+        if now - self._idle_since < idle_need:
+            return
+
+        self._notified = True
+        self._seen_busy = False
+        self.state.ready_pending = True
+        self.log.ok("処理が完了しました。次のプロンプトを送信できます")
+        if self.on_ready:
+            try:
+                self.on_ready()
+            except Exception:
+                pass
 
     # ------------------------------------------------------------------ 本体
     def run(self) -> None:
@@ -1180,14 +1413,10 @@ class Monitor(threading.Thread):
                 self.log.warn("Esc 2 回押しを検知したため緊急停止しました")
                 self.on_emergency_stop()
 
-            if self._last_test_mode is None:
-                self._last_test_mode = self.state.test_mode
-            elif self._last_test_mode != self.state.test_mode:
-                self._last_test_mode = self.state.test_mode
-                self.reset_dedupe()
-
-            if not self.state.auto_allow:
+            # Auto Allow と通知のどちらかが ON なら監視する
+            if not (self.state.auto_allow or self.state.notify_enabled):
                 self._last_kiro_found = None
+                self.state.kiro_busy = False
                 time.sleep(0.05)
                 continue
 
@@ -1204,7 +1433,8 @@ class Monitor(threading.Thread):
                 time.sleep(1.0)
 
     def _tick(self, uia: UiaSession) -> None:
-        res = scan(uia, self.cfg)
+        notify_on = self.state.notify_enabled
+        res = scan(uia, self.cfg, check_busy=notify_on)
 
         # --- Kiro の検出状況 ---
         found = bool(res.windows)
@@ -1219,6 +1449,14 @@ class Monitor(threading.Thread):
             else:
                 self.log.warn("Kiro のウィンドウが見つかりません")
         if not found:
+            return
+
+        # --- 「次のプロンプトを送れる状態」の判定 ---
+        if notify_on:
+            self._update_ready(res)
+
+        # --- 承認 UI の処理は Auto Allow が ON のときだけ ---
+        if not self.state.auto_allow:
             return
 
         # --- 承認 UI 関連ボタンのログ（同じ画面で繰り返し出さない） ---
@@ -1257,29 +1495,13 @@ class Monitor(threading.Thread):
         self._clicked_keys = {
             kk: tt for kk, tt in self._clicked_keys.items() if now - tt < 30.0
         }
-        self._test_logged = {
-            kk: tt for kk, tt in self._test_logged.items() if now - tt < 30.0
-        }
         if k in self._clicked_keys:
-            return
-        if self.state.test_mode and k in self._test_logged:
             return
 
         self.state.detect_count += 1
         self.log.detect(f"Allow ボタンを検出しました（{btn.rect}）")
         for c in res.checks:
             self.log.info(f"確認: {c}")
-
-        # --- テストモード ---
-        if self.state.test_mode:
-            self.log.ok("クリック対象確認 OK")
-            self.log.warn(
-                "テストモードのためクリックしませんでした"
-                "（実際に押すには [テストモード: OFF] にしてください）"
-            )
-            # _clicked_keys には入れない。入れるとテストモードを OFF にした直後に押せなくなる。
-            self._test_logged[k] = now
-            return
 
         # --- 暴走検知 ---
         limit = int(self.cfg["max_clicks_per_minute"])
@@ -1318,6 +1540,9 @@ class App:
         self.log = LogBus()
         self.state = AppState(self.cfg)
 
+        self._hwnd = 0
+        self._topmost_job = None
+
         self.root = tk.Tk()
         self.root.title(f"{APP_NAME} {APP_VERSION}")
         self.root.geometry("760x560")
@@ -1334,7 +1559,9 @@ class App:
         self._build()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
-        self.monitor = Monitor(self.cfg, self.state, self.log, self._emergency_stop)
+        self.monitor = Monitor(
+            self.cfg, self.state, self.log, self._emergency_stop, self._on_ready
+        )
         self.monitor.start()
 
         self.log.info(f"{APP_NAME} {APP_VERSION} を起動しました")
@@ -1344,8 +1571,7 @@ class App:
             f"'{self.cfg['target_button_name']}' だけです"
         )
         self.log.info("Always allow / Deny / Always deny / Cancel はクリックしません")
-        if self.state.test_mode:
-            self.log.warn("テストモードが ON です。検出しても実際にはクリックしません")
+        self.log.info("[Auto Allow: ON] にすると監視を開始します")
 
         self._pump()
 
@@ -1364,12 +1590,14 @@ class App:
         )
         self.btn_auto.pack(side="left")
 
-        self.btn_test = tk.Button(
-            head, text="テストモード: ON", width=20, height=2,
+
+
+        self.btn_notify = tk.Button(
+            head, text="完了通知: ON", width=18, height=2,
             font=("Segoe UI", 12, "bold"), relief="raised",
-            command=self._toggle_test,
+            command=self._toggle_notify,
         )
-        self.btn_test.pack(side="left", padx=(10, 0))
+        self.btn_notify.pack(side="left", padx=(10, 0))
 
         self.btn_stop = tk.Button(
             head, text="緊急停止", width=12, height=2,
@@ -1387,6 +1615,13 @@ class App:
             justify="left",
         )
         self.lbl_state.pack(side="left")
+
+        self.lbl_ready = tk.Label(
+            self.root, text="", bg="#1e1e1e", fg="#1e1e1e",
+            font=("Segoe UI", 13, "bold"), anchor="center",
+        )
+        self.lbl_ready.pack(fill="x", padx=12, pady=(0, 4))
+        self.lbl_ready.bind("<Button-1>", lambda _e: self._clear_ready())
 
         tools = tk.Frame(self.root, bg=bg)
         tools.pack(fill="x", padx=12, pady=(0, 6))
@@ -1422,20 +1657,114 @@ class App:
         self.monitor.reset_dedupe()
         if self.state.auto_allow:
             self.log.ok("Auto Allow を開始しました")
-            if self.state.test_mode:
-                self.log.warn("テストモードのため実際のクリックは行いません")
         else:
             self.log.info("Auto Allow を停止しました")
         self._refresh_labels()
 
-    def _toggle_test(self) -> None:
-        self.state.test_mode = not self.state.test_mode
-        self.monitor.reset_dedupe()
-        if self.state.test_mode:
-            self.log.warn("テストモードを ON にしました（検出してもクリックしません）")
-        else:
-            self.log.warn("テストモードを OFF にしました（実際にクリックします）")
+    def _clear_ready(self) -> None:
+        """緑帯をクリックしたら通知表示と一時的な最前面を解除する。"""
+        self.state.ready_pending = False
+        if self._topmost_job is not None:
+            try:
+                self.root.after_cancel(self._topmost_job)
+            except Exception:
+                pass
+            self._topmost_job = None
+        self._release_topmost()
         self._refresh_labels()
+
+    def _toggle_notify(self) -> None:
+        self.state.notify_enabled = not self.state.notify_enabled
+        if self.state.notify_enabled:
+            self.log.info("完了通知を ON にしました")
+        else:
+            self.log.info("完了通知を OFF にしました")
+            self.state.ready_pending = False
+        self._refresh_labels()
+
+    def _top_hwnd(self) -> int:
+        """自分のトップレベルウィンドウのハンドルを返す。
+
+        winfo_id() は 'TkChild' という子ウィンドウを返すため、
+        そのまま使うと最前面化もタスクバー点滅も効かない。
+        ウィンドウが実体化してから親をたどって 'TkTopLevel' を得る。
+        """
+        if self._hwnd and user32.IsWindow(self._hwnd):
+            return self._hwnd
+        try:
+            self.root.update_idletasks()
+        except Exception:
+            pass
+        h = 0
+        try:
+            h = int(self.root.wm_frame(), 16)
+        except Exception:
+            h = 0
+        if not h:
+            try:
+                h = int(self.root.winfo_id())
+            except Exception:
+                return 0
+        h = root_hwnd(h)
+        # トップレベル（親を持たない）と確認できたときだけ覚える
+        try:
+            if h and not user32.GetParent(h):
+                self._hwnd = h
+        except Exception:
+            pass
+        return h
+
+    def _on_ready(self) -> None:
+        """Kiro の処理が終わったときに呼ばれる（監視スレッドから）。"""
+        ncfg = self.cfg["notify"]
+        if ncfg.get("sound", True):
+            notify_beep()
+        if ncfg.get("flash_taskbar", True):
+            flash_window(self._top_hwnd())
+        # GUI 操作は必ず GUI スレッドで行う
+        self.root.after(0, self._refresh_labels)
+        if ncfg.get("bring_to_front", True):
+            self.root.after(0, self._bring_to_front)
+
+    def _bring_to_front(self) -> None:
+        """完了通知のときだけ最前面に出す。常時固定はしない。"""
+        ncfg = self.cfg["notify"]
+        hwnd = self._top_hwnd()
+        try:
+            if self.root.state() == "iconic":
+                self.root.deiconify()
+        except Exception:
+            pass
+        restore_if_minimized(hwnd)
+        try:
+            self.root.attributes("-topmost", True)
+            self.root.lift()
+        except Exception:
+            pass
+        if ncfg.get("focus_window", False):
+            # Windows はフォーカスの横取りを制限しているので失敗しても続行する。
+            # -topmost が効いているので画面上は最前面に出ている。
+            restore_foreground(hwnd)
+        # 一定時間後に最前面を解除する
+        if self._topmost_job is not None:
+            try:
+                self.root.after_cancel(self._topmost_job)
+            except Exception:
+                pass
+        secs = max(0.5, float(ncfg.get("front_seconds", 5.0)))
+        self._topmost_job = self.root.after(
+            int(secs * 1000), self._release_topmost
+        )
+
+    def _release_topmost(self) -> None:
+        """一時的な最前面表示を解除する。"""
+        self._topmost_job = None
+        if self.cfg["ui"].get("always_on_top"):
+            return  # 常時最前面設定のときは触らない
+        try:
+            self.root.attributes("-topmost", False)
+        except Exception:
+            pass
 
     def _emergency_stop_from_gui(self) -> None:
         if self.state.auto_allow:
@@ -1490,13 +1819,6 @@ class App:
         self.log.detect(f"Allow ボタンを検出しました（{btn.rect}）")
         for c in res.checks:
             self.log.info(f"確認: {c}")
-        if self.state.test_mode:
-            self.log.ok("クリック対象確認 OK")
-            self.log.warn(
-                "テストモードのためクリックしませんでした"
-                "（実際に押すには [テストモード: OFF] にしてください）"
-            )
-            return
         self.log.ok("クリック対象確認 OK")
         if click_allow(uia, win, btn, self.cfg, self.log):
             self.state.click_count += 1
@@ -1521,7 +1843,6 @@ class App:
     # ------------------------------------------------------------------ 表示
     def _refresh_labels(self) -> None:
         on = self.state.auto_allow
-        test = self.state.test_mode
         self.btn_auto.configure(
             text=f"Auto Allow: {'ON' if on else 'OFF'}",
             bg="#0e639c" if on else "#3a3a3a",
@@ -1529,20 +1850,23 @@ class App:
             activebackground="#1177bb" if on else "#4a4a4a",
             activeforeground="white",
         )
-        self.btn_test.configure(
-            text=f"テストモード: {'ON' if test else 'OFF'}",
-            bg="#a06000" if test else "#3a3a3a",
+        notify = self.state.notify_enabled
+        self.btn_notify.configure(
+            text=f"完了通知: {'ON' if notify else 'OFF'}",
+            bg="#2d7d46" if notify else "#3a3a3a",
             fg="white",
-            activebackground="#c07800" if test else "#4a4a4a",
+            activebackground="#379553" if notify else "#4a4a4a",
             activeforeground="white",
         )
-        if not on:
-            status = "現在の状態: 停止中（何もしません）"
-        elif test:
-            status = "現在の状態: 監視中（テストモード：クリックしません）"
-        else:
+        if on:
             status = "現在の状態: 監視中（Allow を自動クリックします）"
+        elif notify:
+            status = "現在の状態: 自動クリックは停止中（完了通知のみ監視）"
+        else:
+            status = "現在の状態: 停止中（何もしません）"
         kiro = "検出中" if self.state.kiro_found else "未検出"
+        if notify and self.state.kiro_found:
+            kiro += "／処理中" if self.state.kiro_busy else "／待機中"
         self.lbl_state.configure(
             text=(
                 f"{status}\n"
@@ -1550,6 +1874,13 @@ class App:
                 f"Allow 検出回数: {self.state.detect_count}"
             )
         )
+        if self.state.ready_pending:
+            self.lbl_ready.configure(
+                text="✓ 処理が完了しました。次のプロンプトを送信できます",
+                bg="#2d7d46", fg="white",
+            )
+        else:
+            self.lbl_ready.configure(text="", bg="#1e1e1e", fg="#1e1e1e")
 
     def _pump(self) -> None:
         rows = self.log.drain()
