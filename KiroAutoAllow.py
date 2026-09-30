@@ -20,6 +20,7 @@ import ctypes
 import json
 import os
 import queue
+import re
 import sys
 import threading
 import time
@@ -137,6 +138,8 @@ DEFAULTS: dict[str, Any] = {
         "auto_allow_default": False,
         "max_log_lines": 800,
         "max_allowed_items": 30,
+        # Allow した内容の欄に、実際のコマンドも併記するか
+        "show_raw_command": True,
         "always_on_top": False,
     },
     "dump": {"max_depth": 16, "max_nodes": 6000, "open_after_dump": True},
@@ -184,7 +187,7 @@ INFO, OK, WARN, ERROR, DETECT = "info", "ok", "warn", "error", "detect"
 class LogBus:
     def __init__(self) -> None:
         self._q: "queue.Queue[tuple[str, str, str]]" = queue.Queue()
-        self._allowed_q: "queue.Queue[tuple[str, str]]" = queue.Queue()
+        self._allowed_q: "queue.Queue[tuple[str, str, str]]" = queue.Queue()
         self._lock = threading.Lock()
         self._file: Path | None = None
         self._day = None
@@ -217,13 +220,18 @@ class LogBus:
     def detect(self, m: str) -> None:
         self.log(m, DETECT)
 
-    def allowed(self, text: str) -> None:
-        """Allow した内容を専用欄とログの両方へ流す。"""
-        self._allowed_q.put((datetime.now().strftime("%H:%M:%S"), text))
-        self.log(f"許可した内容: {text}", OK)
+    def allowed(self, summary: str, detail: str) -> None:
+        """Allow した内容を専用欄とログの両方へ流す。
 
-    def drain_allowed(self, limit: int = 50) -> list[tuple[str, str]]:
-        out: list[tuple[str, str]] = []
+        summary は初心者向けの言い換え、detail は実際のコマンド。
+        """
+        self._allowed_q.put((datetime.now().strftime("%H:%M:%S"), summary, detail))
+        self.log(f"許可した内容: {summary}", OK)
+        if detail:
+            self.log(f"　実行されたコマンド: {detail}", INFO)
+
+    def drain_allowed(self, limit: int = 50) -> list[tuple[str, str, str]]:
+        out: list[tuple[str, str, str]] = []
         for _ in range(limit):
             try:
                 out.append(self._allowed_q.get_nowait())
@@ -996,12 +1004,173 @@ def approval_block_texts(uia: UiaSession, root, buttons: list[ElemInfo],
     return out
 
 
+#: 承認メッセージの定型文（この後ろが実際のコマンド）
+_APPROVAL_PREFIX_RE = re.compile(
+    r"^.*?(?:approval is required to continue|承認が必要)\s*[:：]?\s*",
+    re.IGNORECASE | re.DOTALL,
+)
+
+#: コマンド文字列 → 初心者向けの日本語。
+#: 上から順に判定するので、危険な操作と具体的な操作を先に置いている。
+#: (正規表現, 日本語の説明, 注意が必要か, 系統)
+#: 系統が同じルールは最初に一致した 1 つだけを採用する。
+#: これで「アプリを .exe にビルドする ＋ Python のプログラムを実行する」
+#: のような冗長な並びを防ぐ。
+_COMMAND_RULES: list[tuple[str, str, bool, str]] = [
+    # ---------------- 取り返しがつきにくい操作 ----------------
+    (r"\brm\s+-[a-z]*[rf]|\bRemove-Item\b|\bdel\s|\berase\s|\brmdir\b|\brd\s+/s",
+     "ファイルやフォルダを削除する", True, "file_del"),
+    (r"\bgit\s+reset\s+--hard\b|\bgit\s+clean\s+-[a-z]*f",
+     "作業中の変更を捨てて元に戻す", True, "git"),
+    (r"\b(format|diskpart|mkfs)\b", "ディスクを初期化する", True, "disk"),
+    (r"\b(shutdown|Restart-Computer|Stop-Computer)\b",
+     "PC を再起動・シャットダウンする", True, "power"),
+    (r"\breg\s+(add|delete|import)\b|\bNew-ItemProperty\b"
+     r"|\bSet-ItemProperty\b[^\n]*HK(LM|CU)",
+     "Windows の設定（レジストリ）を書き換える", True, "registry"),
+    (r"\b(taskkill|Stop-Process)\b",
+     "起動中のプログラムを強制終了する", True, "process"),
+    (r"\bgit\s+push\b",
+     "変更をリモートに送信する（git push）", True, "git"),
+    (r"\b(pip|npm|yarn|pnpm)\s+uninstall\b|\bpip\s+remove\b",
+     "ライブラリを削除する", True, "package"),
+    (r"\b(curl|wget|Invoke-WebRequest|Invoke-RestMethod)\b",
+     "インターネットに通信する", True, "network"),
+    (r"\b(icacls|takeown|attrib)\b",
+     "ファイルの権限や属性を変更する", True, "perm"),
+
+    # ---------------- Git ----------------
+    (r"\bgit\s+commit\b", "変更を記録する（git commit）", False, "git"),
+    (r"\bgit\s+add\b", "変更をコミット対象に追加する", False, "git"),
+    (r"\bgit\s+(pull|fetch|clone)\b", "リモートの変更を取得する", False, "git"),
+    (r"\bgit\s+(status|log|diff|show|reflog)\b",
+     "Git の状態を確認する", False, "git"),
+    (r"\bgit\s+(checkout|switch|branch|merge|rebase|stash)\b",
+     "ブランチを操作する", False, "git"),
+    (r"\bgit\b", "Git を操作する", False, "git"),
+
+    # ---------------- パッケージ管理 ----------------
+    (r"\bpip\s+install\b", "Python のライブラリを追加する", False, "package"),
+    (r"\b(npm|yarn|pnpm)\s+(install|add|ci)\b",
+     "Node.js のパッケージを追加する", False, "package"),
+    (r"\b(npm|yarn|pnpm)\s+run\b",
+     "Node.js のスクリプトを実行する", False, "package"),
+    (r"\b(winget|choco)\b", "アプリをインストールする", True, "package"),
+
+    # ---------------- Python ----------------
+    (r"\bPyInstaller\b", "アプリを .exe にビルドする", False, "python"),
+    (r"\bpy_compile\b",
+     "Python コードの文法をチェックする", False, "python"),
+    (r"\b(pytest|unittest)\b", "テストを実行する", False, "python"),
+    (r"-m\s+venv\b|\bvirtualenv\b",
+     "Python の作業環境を新しく作る", False, "python"),
+    (r"\bpython(w|3)?(\.exe)?\b",
+     "Python のプログラムを実行する", False, "python"),
+
+    # ---------------- 圧縮・展開 ----------------
+    # ファイル名の「.zip」に反応しないよう、コマンド名だけを見る
+    (r"\bExpand-Archive\b|\btar\s+-[a-z]*x|\bunzip\b",
+     "ZIP などを展開する", False, "archive"),
+    (r"\bCompress-Archive\b|\btar\s+-[a-z]*c|\b7z\s+a\b|\bzip\s+-",
+     "ファイルを ZIP にまとめる", False, "archive"),
+
+    # ---------------- ファイル操作 ----------------
+    (r"\b(Copy-Item|xcopy|robocopy)\b|\bcopy\s",
+     "ファイルをコピーする", False, "file_copy"),
+    (r"\b(Move-Item|Rename-Item)\b|\bmove\s|\bren\s",
+     "ファイルを移動・名前変更する", False, "file_move"),
+    (r"\b(New-Item|mkdir)\b|\bmd\s",
+     "フォルダやファイルを新しく作る", False, "file_new"),
+    (r"\b(Set-Content|Add-Content|Out-File)\b",
+     "ファイルに書き込む", False, "file_write"),
+    (r"\b(Get-Content|Select-String|findstr|more)\b|\btype\s|\bcat\s",
+     "ファイルの中身を読む", False, "file_read"),
+    (r"\b(Get-ChildItem|Get-Item|Test-Path)\b|\bdir\b|\bls\b",
+     "ファイルの一覧や有無を調べる", False, "file_list"),
+    (r"\b(Get-FileHash|certutil)\b",
+     "ファイルが同一か確認する", False, "file_hash"),
+
+    # ---------------- 調査・その他 ----------------
+    (r"\b(ping|nslookup|tracert|Test-NetConnection|ipconfig)\b",
+     "ネットワークの状態を確認する", False, "network"),
+    (r"\b(tasklist|Get-Process|systeminfo)\b",
+     "実行中のプログラムや PC の情報を調べる", False, "process"),
+    (r"\b(Start-Process)\b|\bstart\s", "プログラムを起動する", False, "run"),
+    (r"\b(Start-Sleep|timeout)\b", "少し待つだけ", False, "wait"),
+    (r"\b(echo|Write-Host|Write-Output)\b",
+     "文字を表示するだけ", False, "echo"),
+]
+
+
+def extract_command(detail: str) -> str:
+    """承認メッセージから実際のコマンド部分だけを取り出す。"""
+    if not detail:
+        return ""
+    m = _APPROVAL_PREFIX_RE.search(detail)
+    text = detail[m.end():] if m else detail
+    return text.strip(" /").strip()
+
+
+def explain_command(detail: str, max_labels: int = 3) -> str:
+    """コマンドを初心者にも分かる日本語に言い換える。
+
+    判定はすべてこのアプリ内の文字列マッチで行う（通信はしない）。
+    該当する操作が複数あるときは「＋」でつなぐ。
+    """
+    cmd = extract_command(detail)
+    if not cmd:
+        return "内容を読み取れませんでした"
+
+    labels: list[str] = []
+    used_families: set[str] = set()
+    caution = False
+    for pattern, label, danger, family in _COMMAND_RULES:
+        if len(labels) >= max_labels:
+            break
+        if family in used_families:
+            continue          # 同じ系統では最初に一致した説明だけを使う
+        try:
+            if re.search(pattern, cmd, re.IGNORECASE):
+                used_families.add(family)
+                if label not in labels:
+                    labels.append(label)
+                    if danger:
+                        caution = True
+        except re.error:
+            continue
+
+    if not labels:
+        return "コマンドを実行する"
+    text = " ＋ ".join(labels)
+    return f"【注意】{text}" if caution else text
+
+
 def summarize_approval(lines: list[str], s: dict) -> str:
-    """ログと画面に出すために 1 行へまとめる。"""
+    """ログと画面に出すために 1 行へまとめる。
+
+    承認ブロックには「作業フォルダ」「コマンド」「承認メッセージ」などが
+    別々の要素として並び、同じコマンドが重複して現れる。そのまま並べると
+    読みにくいので整理する。
+
+    1. 承認メッセージ本体が見つかればそれだけを使う（コマンドを含む）
+    2. 見つからない場合は、他の行に丸ごと含まれている行を落としてつなぐ
+    """
     if not lines:
         return ""
-    text = " / ".join(lines)
     limit = int(s.get("approval_detail_max_chars", 300))
+
+    main = ""
+    for n in lines:
+        if _APPROVAL_PREFIX_RE.search(n):
+            main = n
+            break
+
+    if main:
+        text = main
+    else:
+        kept = [n for n in lines if not any(n != o and n in o for o in lines)]
+        text = " / ".join(kept or lines)
+
     if len(text) > limit:
         text = text[:limit] + "…"
     return text
@@ -1570,7 +1739,10 @@ class Monitor(threading.Thread):
                 self._last_approval_key = key
                 self.log.detect("承認画面を検出しました")
                 if res.approval_detail:
-                    self.log.info(f"許可を求められた内容: {res.approval_detail}")
+                    self.log.info(
+                        f"許可を求められた内容: {explain_command(res.approval_detail)}"
+                    )
+                    self.log.info(f"　コマンド: {res.approval_detail}")
                 for _w, b in res.approval_buttons:
                     self.log.info(
                         f"検出したボタン：{b.norm_name}"
@@ -1620,7 +1792,8 @@ class Monitor(threading.Thread):
             self.state.click_count += 1
             self._clicks.append(now)
             self._clicked_keys[k] = now
-            self.log.allowed(res.approval_detail or "（内容を読み取れませんでした）")
+            detail = res.approval_detail
+            self.log.allowed(explain_command(detail), detail)
         self._cooldown_until = time.monotonic() + float(self.cfg["post_click_cooldown_sec"])
 
 
@@ -1732,11 +1905,15 @@ class App:
         )
         allowf.pack(fill="x", padx=12, pady=(0, 6))
         self.txt_allowed = tk.Text(
-            allowf, height=5, bg="#101820", fg="#9cdcfe",
+            allowf, height=7, bg="#101820", fg="#9cdcfe",
             insertbackground="#9cdcfe", font=("Consolas", 9), wrap="word",
             state="disabled", borderwidth=0,
         )
         self.txt_allowed.pack(fill="x", padx=4, pady=4)
+        # 1 行目（要約）と 2 行目（実際のコマンド）を色で区別する
+        self.txt_allowed.tag_configure("allow_sum", foreground="#9cdcfe")
+        self.txt_allowed.tag_configure("allow_warn", foreground="#f0a45a")
+        self.txt_allowed.tag_configure("allow_raw", foreground="#6a8ba0")
 
         tools = tk.Frame(self.root, bg=bg)
         tools.pack(fill="x", padx=12, pady=(0, 6))
@@ -1944,10 +2121,23 @@ class App:
     def _pump(self) -> None:
         allowed = self.log.drain_allowed()
         if allowed:
+            show_raw = bool(self.cfg["ui"].get("show_raw_command", True))
             self.txt_allowed.configure(state="normal")
-            for stamp, text in allowed:
-                self.txt_allowed.insert("1.0", f"{stamp}  {text}\n")
-            keep = max(1, int(self.cfg["ui"].get("max_allowed_items", 30)))
+            for stamp, summary, detail in allowed:
+                # 1 行目に分かりやすい要約、2 行目に実際のコマンドを出す。
+                # 新しいものを上にするため、2 行まとめて先頭へ挿入する。
+                block = f"{stamp}  {summary}\n"
+                raw_line = ""
+                if show_raw and detail:
+                    raw_line = f"          {detail}\n"
+                    block += raw_line
+                self.txt_allowed.insert("1.0", block)
+                tag = "allow_warn" if summary.startswith("【注意】") else "allow_sum"
+                self.txt_allowed.tag_add(tag, "1.0", "1.end")
+                if raw_line:
+                    self.txt_allowed.tag_add("allow_raw", "2.0", "2.end")
+            per = 2 if show_raw else 1
+            keep = max(1, int(self.cfg["ui"].get("max_allowed_items", 30))) * per
             total = int(self.txt_allowed.index("end-1c").split(".")[0])
             if total > keep:
                 self.txt_allowed.delete(f"{keep + 1}.0", "end")

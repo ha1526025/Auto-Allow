@@ -186,14 +186,45 @@ python -m venv .venv
 .\.venv\Scripts\python.exe KiroAutoAllow.py
 ```
 
-exe を作る場合は `build.bat` をダブルクリック（`dist\KiroAutoAllow.exe` ができます）。
+exe を作るだけなら `build.bat`、配布用 ZIP まで作るなら `make_release.bat` を実行します。
 
 | ファイル | 役割 |
 | --- | --- |
 | `KiroAutoAllow.py` | アプリ本体（1 ファイル完結） |
 | `KiroAutoAllow.spec` | PyInstaller 設定 |
-| `build.bat` | exe ビルド |
+| `build.bat` | exe をビルドするだけ |
+| `make_release.bat` | 検証 → ビルド → ZIP 作成 → 展開起動テストまで一括 |
+| `verify_explain.py` | コマンド→日本語変換の自動テスト |
+| `package.ps1` | ZIP 作成と「別フォルダへ展開して起動」テスト |
 | `requirements.txt` | 実行用（`comtypes` のみ） |
 | `requirements-dev.txt` | ビルド用（`pyinstaller`） |
+| `release/` | 配布物（`KiroAutoAllow.exe` と `README.txt` のみ） |
+| `Kiro-Auto-Allow.zip` | 配布用 ZIP |
+
+### 配布物の作り方
+
+`make_release.bat` を実行すると次の順で処理し、結果を
+`verify_result.txt` と `package_result.txt` に書き出します。
+
+1. 変換ロジックの自動テスト（24 パターン ＋ 冗長ラベル検査）
+2. `--clean` 付きで exe をビルド
+3. `release` を exe + README.txt で再構成
+4. `Kiro-Auto-Allow.zip` を作成
+5. `%TEMP%` の別フォルダへ展開し、そこから起動して独立性を確認
+
+5 では、起動したプロセスの実行パスがテストフォルダであること、
+アプリのログが増えること（UI Automation の初期化成功）を確認します。
+exe に `.venv` / `site-packages` / `C:\Users` の文字列が含まれないことも
+検査しています。
+
+> `package.ps1` は ASCII のみで書いています。PowerShell 5.1 は `.ps1` を
+> システムのコードページ（日本語環境では cp932）として読むため、
+> UTF-8 の日本語を入れると構文エラーになります。編集時は注意してください。
 
 動作環境: Windows 11 / 64bit。画像認識は使っていません。
+
+### コード署名について
+
+署名は付けていません。そのため配布先で SmartScreen の警告が出ることが
+あります。回避処理は意図的に実装していません。対処方法は
+`release/README.txt` に記載しています。
